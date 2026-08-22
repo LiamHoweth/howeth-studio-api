@@ -3,7 +3,17 @@ import { after, before, describe, it } from "node:test";
 import { createApp } from "../src/app.js";
 
 const installation = { id: "11111111-1111-4111-8111-111111111111", platform: "ios", app_version: "1.2.0" };
-const calls = { events: [], careers: [], rejections: [] };
+const account = {
+  id: "44444444-4444-4444-8444-444444444444",
+  provider: "apple",
+  verified_email: "player@example.com",
+  expires_at: new Date("2027-01-01T00:00:00Z")
+};
+const calls = {
+  events: [], careers: [], rejections: [], accountCareers: [], accountRejections: [],
+  accountSessions: [], saveSlots: [], deletedAccounts: [], revokedSessions: [],
+  expireNextAccountSession: false
+};
 
 const database = {
   async ping() { return true; },
@@ -11,6 +21,33 @@ const database = {
     return { id: installation.id, created_at: new Date("2026-08-21T12:00:00Z") };
   },
   async findInstallationByTokenHash() { return installation; },
+  async createAccountSession(input) {
+    calls.accountSessions.push(input);
+    return { id: account.id, provider: input.identity.provider, email: input.identity.email };
+  },
+  async findAccountBySessionTokenHash() {
+    if (calls.expireNextAccountSession) {
+      calls.expireNextAccountSession = false;
+      return null;
+    }
+    return account;
+  },
+  async revokeAccountSession(hash) { calls.revokedSessions.push(hash); },
+  async getAccountIdentities() { return [{ provider: "apple", apple_refresh_token_ciphertext: "encrypted" }]; },
+  async deleteAccount(id) { calls.deletedAccounts.push(id); },
+  async getCloudSaveSlots() { return calls.saveSlots; },
+  async syncCloudSaveSlots(_accountId, slots) {
+    calls.saveSlots = slots.map((slot, index) => ({
+      slot_index: slot.slotIndex,
+      save_version: slot.saveVersion,
+      is_occupied: slot.isOccupied,
+      payload: slot.payload,
+      client_updated_at: slot.updatedAt,
+      revision: index + 1,
+      server_updated_at: new Date("2026-08-22T12:00:00Z")
+    }));
+    return calls.saveSlots;
+  },
   async insertEvents(installationId, events) {
     calls.events.push({ installationId, events });
     return events.length;
@@ -21,6 +58,20 @@ const database = {
   },
   async recordRejectedCareer(installationId, careerId, reason, career) {
     calls.rejections.push({ installationId, careerId, reason, career });
+  },
+  async upsertAccountCareer(accountId, career) {
+    calls.accountCareers.push({ accountId, career });
+    return { accepted: true };
+  },
+  async recordRejectedAccountCareer(accountId, careerId, reason, career) {
+    calls.accountRejections.push({ accountId, careerId, reason, career });
+  },
+  async deleteAccountCareer() {},
+  async getAccountLeaderboard() {
+    return [{
+      display_name: "Account QB", position: "QB", team_id: "AUS", score: 4321,
+      updated_at: new Date("2026-08-22T12:00:00Z")
+    }];
   },
   async deleteInstallation() {},
   async getLeaderboard() {
@@ -55,11 +106,20 @@ describe("Football Era API", () => {
   let origin;
 
   before(async () => {
+    const providerAuth = {
+      async verifyApple() {
+        return { provider: "apple", subject: "apple-subject", email: "player@example.com", refreshTokenCiphertext: "encrypted" };
+      },
+      async verifyGoogle() {
+        return { provider: "google", subject: "google-subject", email: "player@gmail.com", refreshTokenCiphertext: null };
+      },
+      async revokeApple(value) { assert.equal(value, "encrypted"); }
+    };
     const app = createApp({ database, env: {
       ADMIN_API_KEY: "test-admin-key",
       ADMIN_DASHBOARD_USER: "developer",
       ADMIN_DASHBOARD_PASSWORD: "test-dashboard-password"
-    } });
+    }, providerAuth });
     server = app.listen(0, "127.0.0.1");
     await new Promise((resolve) => server.once("listening", resolve));
     const address = server.address();
@@ -86,6 +146,121 @@ describe("Football Era API", () => {
     assert.equal(response.status, 201);
     assert.equal(body.installationId, installation.id);
     assert.ok(body.token.length >= 40);
+  });
+
+  it("creates separate Apple and Google account sessions", async () => {
+    for (const provider of ["apple", "google"]) {
+      const response = await fetch(`${origin}/api/v2/auth/${provider}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(provider === "apple" ? {
+          identityToken: "i".repeat(120), authorizationCode: "authorization-code", nonce: "n".repeat(32)
+        } : {
+          idToken: "g".repeat(120), nonce: "n".repeat(32)
+        })
+      });
+      assert.equal(response.status, 200);
+      const body = await response.json();
+      assert.equal(body.account.provider, provider);
+      assert.ok(body.accessToken.length >= 40);
+    }
+    assert.notEqual(calls.accountSessions.at(-2).identity.subject, calls.accountSessions.at(-1).identity.subject);
+  });
+
+  it("requires an account for v2 leaderboards", async () => {
+    const unauthorized = await fetch(`${origin}/api/v2/leaderboards`);
+    assert.equal(unauthorized.status, 401);
+    const authorized = await fetch(`${origin}/api/v2/leaderboards?metric=legacy_score&position=QB`, {
+      headers: { authorization: `Bearer ${"s".repeat(43)}` }
+    });
+    assert.equal(authorized.status, 200);
+    assert.equal((await authorized.json()).entries[0].displayName, "Account QB");
+  });
+
+  it("rejects an expired or revoked account session", async () => {
+    calls.expireNextAccountSession = true;
+    const response = await fetch(`${origin}/api/v2/account`, {
+      headers: { authorization: `Bearer ${"s".repeat(43)}` }
+    });
+    assert.equal(response.status, 401);
+  });
+
+  it("syncs structurally validated cloud save slots", async () => {
+    const updatedAt = new Date().toISOString();
+    const response = await fetch(`${origin}/api/v2/save-slots`, {
+      method: "PUT",
+      headers: { authorization: `Bearer ${"s".repeat(43)}`, "content-type": "application/json" },
+      body: JSON.stringify({ slots: [{
+        slotIndex: 0, saveVersion: 7, isOccupied: true, updatedAt,
+        payload: {
+          id: "SLOT_1", slotIndex: 0, isOccupied: true,
+          createdAt: updatedAt, updatedAt, player: {}, league: {}
+        }
+      }] })
+    });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).slots[0].revision, 1);
+
+    const entitlementLeak = await fetch(`${origin}/api/v2/save-slots`, {
+      method: "PUT",
+      headers: { authorization: `Bearer ${"s".repeat(43)}`, "content-type": "application/json" },
+      body: JSON.stringify({ slots: [{
+        slotIndex: 0, saveVersion: 7, isOccupied: true, updatedAt,
+        payload: {
+          id: "SLOT_1", slotIndex: 0, isOccupied: true,
+          createdAt: updatedAt, updatedAt, player: {}, league: {}, purchases: {}
+        }
+      }] })
+    });
+    assert.equal(entitlementLeak.status, 400);
+
+    const nestedEntitlementLeak = await fetch(`${origin}/api/v2/save-slots`, {
+      method: "PUT",
+      headers: { authorization: `Bearer ${"s".repeat(43)}`, "content-type": "application/json" },
+      body: JSON.stringify({ slots: [{
+        slotIndex: 0, saveVersion: 7, isOccupied: true, updatedAt,
+        payload: {
+          id: "SLOT_1", slotIndex: 0, isOccupied: true,
+          createdAt: updatedAt, updatedAt, player: { preferences: {} }, league: {}
+        }
+      }] })
+    });
+    assert.equal(nestedEntitlementLeak.status, 400);
+  });
+
+  it("revokes only the active opaque account session on sign-out", async () => {
+    const response = await fetch(`${origin}/api/v2/auth/sign-out`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${"s".repeat(43)}` }
+    });
+    assert.equal(response.status, 204);
+    assert.equal(calls.revokedSessions.length, 1);
+    assert.match(calls.revokedSessions[0], /^[a-f0-9]{64}$/);
+  });
+
+  it("automatically publishes authenticated careers", async () => {
+    const response = await fetch(`${origin}/api/v2/careers/ACCOUNT_CAREER`, {
+      method: "PUT",
+      headers: { authorization: `Bearer ${"s".repeat(43)}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        displayName: "Account Player", position: "QB", teamId: "AUS", seasonYear: 2026,
+        careerYear: 1, gamesPlayed: 3, yards: 900, touchdowns: 7, championships: 0,
+        overall: 74, followers: 1200, netWorth: 250000, legacyScore: 155,
+        retired: false, clientUpdatedAt: new Date().toISOString()
+      })
+    });
+    assert.equal(response.status, 204);
+    assert.equal(calls.accountCareers.at(-1).career.leaderboardOptIn, true);
+    assert.equal(calls.accountCareers.at(-1).career.displayName, "Account Player");
+  });
+
+  it("deletes account-owned server data", async () => {
+    const response = await fetch(`${origin}/api/v2/account`, {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${"s".repeat(43)}` }
+    });
+    assert.equal(response.status, 204);
+    assert.equal(calls.deletedAccounts.at(-1), account.id);
   });
 
   it("accepts allowlisted retention events", async () => {

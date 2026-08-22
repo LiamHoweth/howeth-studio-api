@@ -44,7 +44,7 @@ async function load(){
     const [overview,retention,funnel,balance,health]=await Promise.all([
       json("/api/v1/admin/stats/overview"),json("/api/v1/admin/stats/retention"),json("/api/v1/admin/stats/funnel"),json("/api/v1/admin/stats/balance"),json("/api/v1/admin/stats/leaderboard-health")
     ]);
-    fillMetrics($("overview"),[["Installations",fmt(overview.installations)],["DAU",fmt(overview.dau)],["WAU",fmt(overview.wau)],["MAU",fmt(overview.mau)],["Events",fmt(overview.events)],["Careers",fmt(overview.careers)],["Public careers",fmt(overview.public_careers)],["Current version",overview.current_app_version||"—"]]);
+    fillMetrics($("overview"),[["Installations",fmt(overview.installations)],["Accounts",fmt(overview.accounts)],["DAU",fmt(overview.dau)],["WAU",fmt(overview.wau)],["MAU",fmt(overview.mau)],["Events",fmt(overview.events)],["Cloud slots",fmt(overview.cloud_slots)],["Careers",fmt(overview.careers)],["Public careers",fmt(overview.public_careers)],["Current version",overview.current_app_version||"—"]]);
     fillMetrics($("retention"),[["D1",pct(retention.d1.rate)],["D7",pct(retention.d7.rate)],["D30",pct(retention.d30.rate)],["30-day peak DAU",fmt(Math.max(0,...retention.dailyActiveInstallations.map(x=>x.count)))]]);
     const daily=retention.dailyActiveInstallations;const max=Math.max(1,...daily.map(x=>Number(x.count)));$("daily").replaceChildren(...daily.map(row=>{const bar=document.createElement("div");bar.className="bar";bar.style.height=(Math.max(3,Number(row.count)/max*100))+"%";bar.title=row.day+": "+row.count;return bar}));
     $("funnel").replaceChildren(...funnel.steps.map(step=>{const el=document.createElement("div");el.className="funnel-step";const count=document.createElement("strong");count.textContent=fmt(step.installations);const label=document.createElement("span");label.textContent=step.label+" · "+pct(step.conversion);el.append(count,label);return el}));
@@ -56,4 +56,3 @@ async function load(){
 }
 $("refresh").addEventListener("click",load);load();
 `;
-

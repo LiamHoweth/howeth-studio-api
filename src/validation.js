@@ -47,6 +47,19 @@ function integer(value, { min = Number.MIN_SAFE_INTEGER, max = Number.MAX_SAFE_I
   return Number.isInteger(value) && value >= min && value <= max ? value : null;
 }
 
+const FORBIDDEN_CLOUD_KEYS = new Set([
+  "purchases", "accountEntitlements", "preferences", "reminders",
+  "accessToken", "providerSubject", "verifiedEmail"
+]);
+
+function containsForbiddenCloudKey(value) {
+  if (Array.isArray(value)) return value.some(containsForbiddenCloudKey);
+  if (!isObject(value)) return false;
+  return Object.entries(value).some(([key, nested]) => (
+    FORBIDDEN_CLOUD_KEYS.has(key) || containsForbiddenCloudKey(nested)
+  ));
+}
+
 function isoDate(value, { maxFutureMinutes = 10, maxPastDays = 90 } = {}) {
   if (typeof value !== "string") return null;
   const date = new Date(value);
@@ -67,6 +80,54 @@ export function validateInstallation(body) {
 
 export function validateAppVersion(value) {
   return text(value, { min: 1, max: 32 });
+}
+
+export function validateProviderCredential(provider, body) {
+  if (!isObject(body)) return null;
+  if (provider === "apple") {
+    const nonce = text(body.nonce, { min: 16, max: 200 });
+    const identityToken = text(body.identityToken, { min: 100, max: 10_000 });
+    const authorizationCode = text(body.authorizationCode, { min: 8, max: 4_000 });
+    return identityToken && authorizationCode && nonce ? { identityToken, authorizationCode, nonce } : null;
+  }
+  if (provider === "google") {
+    const idToken = text(body.idToken, { min: 100, max: 10_000 });
+    const nonce = body.nonce == null ? undefined : text(body.nonce, { min: 16, max: 200 });
+    if (body.nonce != null && !nonce) return null;
+    return idToken ? { idToken, ...(nonce ? { nonce } : {}) } : null;
+  }
+  return null;
+}
+
+export function validateCloudSaveSlots(body) {
+  if (!isObject(body) || !Array.isArray(body.slots) || body.slots.length > 5) return null;
+  const seen = new Set();
+  const slots = [];
+  for (const raw of body.slots) {
+    if (!isObject(raw) || !isObject(raw.payload)) return null;
+    const slotIndex = integer(raw.slotIndex, { min: 0, max: 4 });
+    const saveVersion = integer(raw.saveVersion, { min: 1, max: 1000 });
+    const updatedAt = isoDate(raw.updatedAt, { maxFutureMinutes: 1_440, maxPastDays: 36500 });
+    if (slotIndex == null || saveVersion == null || !updatedAt || seen.has(slotIndex)) return null;
+    const payloadId = text(raw.payload.id, { min: 1, max: 100 });
+    const createdAt = isoDate(raw.payload.createdAt, { maxFutureMinutes: 1_440, maxPastDays: 36500 });
+    const payloadUpdatedAt = isoDate(raw.payload.updatedAt, { maxFutureMinutes: 1_440, maxPastDays: 36500 });
+    const allowedSlotKeys = new Set([
+      "id", "slotIndex", "isOccupied", "cloudTombstone", "pendingDraftReveal",
+      "createdAt", "updatedAt", "preview", "player", "league"
+    ]);
+    if (!payloadId || !createdAt || !payloadUpdatedAt || payloadUpdatedAt !== updatedAt) return null;
+    if (Object.keys(raw.payload).some((key) => !allowedSlotKeys.has(key))) return null;
+    if (typeof raw.isOccupied !== "boolean" || raw.payload.slotIndex !== slotIndex || raw.payload.isOccupied !== raw.isOccupied) return null;
+    if (raw.isOccupied && (!isObject(raw.payload.player) || !isObject(raw.payload.league))) return null;
+    if (!raw.isOccupied && (raw.payload.player != null || raw.payload.league != null)) return null;
+    if (raw.payload.cloudTombstone != null && typeof raw.payload.cloudTombstone !== "boolean") return null;
+    if (containsForbiddenCloudKey(raw.payload)) return null;
+    if (Buffer.byteLength(JSON.stringify(raw.payload), "utf8") > 1_000_000) return null;
+    seen.add(slotIndex);
+    slots.push({ slotIndex, saveVersion, updatedAt, isOccupied: raw.isOccupied, payload: raw.payload });
+  }
+  return slots;
 }
 
 function validateEventProperties(name, raw) {
@@ -220,6 +281,10 @@ export function validateCareer(body) {
     retired: body.retired,
     clientUpdatedAt
   };
+}
+
+export function validateAccountCareer(body) {
+  return validateCareer({ ...body, leaderboardOptIn: true });
 }
 
 export function assessCareerPlausibility(career) {
