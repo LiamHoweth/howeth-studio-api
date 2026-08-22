@@ -4,7 +4,12 @@ const EVENT_NAMES = new Set([
   "career_started",
   "week_completed",
   "season_completed",
-  "career_retired"
+  "career_retired",
+  "feature_opened",
+  "life_purchase",
+  "skill_upgraded",
+  "contract_signed",
+  "daily_reward_claimed"
 ]);
 
 export const LEADERBOARD_METRICS = {
@@ -18,6 +23,15 @@ export const LEADERBOARD_METRICS = {
 };
 
 const POSITIONS = new Set(["QB", "RB", "WR"]);
+const FEATURES = new Set(["Career", "League", "Life", "More"]);
+const LIFE_CATEGORIES = new Set(["homes", "cars", "luxury", "services"]);
+const RARITIES = new Set(["COMMON", "UNCOMMON", "RARE", "EPIC", "LEGENDARY"]);
+const ATTRIBUTES = new Set([
+  "speed", "strength", "awareness", "durability", "clutch", "throwPower",
+  "throwAccuracy", "decisionMaking", "breakTackle", "elusiveness", "vision",
+  "catching", "routeRunning", "separation"
+]);
+const REWARD_TYPES = new Set(["xp", "money", "xp_boost", "money_boost"]);
 
 function isObject(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -51,6 +65,10 @@ export function validateInstallation(body) {
   return { platform, appVersion };
 }
 
+export function validateAppVersion(value) {
+  return text(value, { min: 1, max: 32 });
+}
+
 function validateEventProperties(name, raw) {
   const properties = isObject(raw) ? raw : {};
   const position = POSITIONS.has(properties.position) ? properties.position : undefined;
@@ -63,26 +81,63 @@ function validateEventProperties(name, raw) {
       return durationSeconds == null ? null : { durationSeconds };
     }
     case "career_started":
-      return position ? { position } : null;
+      return position && text(properties.archetypeId, { min: 2, max: 48 }) && text(properties.teamId, { min: 1, max: 40 })
+        ? { position, archetypeId: text(properties.archetypeId, { min: 2, max: 48 }), teamId: text(properties.teamId, { min: 1, max: 40 }) }
+        : null;
     case "week_completed": {
       const seasonYear = integer(properties.seasonYear, { min: 1, max: 9999 });
       const week = integer(properties.week, { min: 1, max: 30 });
-      if (!position || seasonYear == null || week == null || typeof properties.won !== "boolean") return null;
-      return { position, seasonYear, week, won: properties.won };
+      const careerYear = integer(properties.careerYear, { min: 1, max: 20 });
+      const yards = integer(properties.yards, { min: 0, max: 800 });
+      const touchdowns = integer(properties.touchdowns, { min: 0, max: 12 });
+      const overall = integer(properties.overall, { min: 60, max: 99 });
+      const health = integer(properties.health, { min: 0, max: 100 });
+      const momentsResolved = integer(properties.momentsResolved, { min: 0, max: 20 });
+      const archetypeId = text(properties.archetypeId, { min: 2, max: 48 });
+      if (!position || !archetypeId || seasonYear == null || careerYear == null || week == null || yards == null || touchdowns == null || overall == null || health == null || momentsResolved == null || typeof properties.won !== "boolean") return null;
+      return { position, archetypeId, seasonYear, careerYear, week, won: properties.won, yards, touchdowns, overall, health, momentsResolved };
     }
     case "season_completed": {
       const seasonYear = integer(properties.seasonYear, { min: 1, max: 9999 });
+      const careerYear = integer(properties.careerYear, { min: 1, max: 20 });
       const gamesPlayed = integer(properties.gamesPlayed, { min: 0, max: 30 });
       const championships = integer(properties.championships, { min: 0, max: 20 });
-      if (!position || seasonYear == null || gamesPlayed == null || championships == null) return null;
-      return { position, seasonYear, gamesPlayed, championships };
+      const wins = integer(properties.wins, { min: 0, max: 30 });
+      const losses = integer(properties.losses, { min: 0, max: 30 });
+      const yards = integer(properties.yards, { min: 0, max: 20_000 });
+      const touchdowns = integer(properties.touchdowns, { min: 0, max: 250 });
+      const overall = integer(properties.overall, { min: 60, max: 99 });
+      const archetypeId = text(properties.archetypeId, { min: 2, max: 48 });
+      if (!position || !archetypeId || seasonYear == null || careerYear == null || gamesPlayed == null || championships == null || wins == null || losses == null || yards == null || touchdowns == null || overall == null || typeof properties.madePlayoffs !== "boolean" || typeof properties.wonChampionship !== "boolean") return null;
+      return { position, archetypeId, seasonYear, careerYear, gamesPlayed, championships, wins, losses, yards, touchdowns, overall, madePlayoffs: properties.madePlayoffs, wonChampionship: properties.wonChampionship };
     }
     case "career_retired": {
       const seasons = integer(properties.seasons, { min: 1, max: 20 });
       const legacyScore = integer(properties.legacyScore, { min: 0, max: 10_000_000 });
-      if (!position || seasons == null || legacyScore == null) return null;
-      return { position, seasons, legacyScore };
+      const championships = integer(properties.championships, { min: 0, max: 20 });
+      const archetypeId = text(properties.archetypeId, { min: 2, max: 48 });
+      if (!position || !archetypeId || seasons == null || legacyScore == null || championships == null || typeof properties.hallOfFame !== "boolean") return null;
+      return { position, archetypeId, seasons, legacyScore, championships, hallOfFame: properties.hallOfFame };
     }
+    case "feature_opened":
+      return FEATURES.has(properties.feature) ? { feature: properties.feature } : null;
+    case "life_purchase":
+      return LIFE_CATEGORIES.has(properties.category) && RARITIES.has(properties.rarity)
+        ? { category: properties.category, rarity: properties.rarity }
+        : null;
+    case "skill_upgraded": {
+      const overall = integer(properties.overall, { min: 60, max: 99 });
+      return ATTRIBUTES.has(properties.attribute) && overall != null ? { attribute: properties.attribute, overall } : null;
+    }
+    case "contract_signed": {
+      const years = integer(properties.years, { min: 1, max: 10 });
+      const careerYear = integer(properties.careerYear, { min: 1, max: 20 });
+      return years != null && careerYear != null && typeof properties.teamChanged === "boolean"
+        ? { years, careerYear, teamChanged: properties.teamChanged }
+        : null;
+    }
+    case "daily_reward_claimed":
+      return REWARD_TYPES.has(properties.rewardType) ? { rewardType: properties.rewardType } : null;
     default:
       return null;
   }
@@ -165,6 +220,21 @@ export function validateCareer(body) {
     retired: body.retired,
     clientUpdatedAt
   };
+}
+
+export function assessCareerPlausibility(career) {
+  if (career.gamesPlayed > career.careerYear * 25) return "games_exceed_career_year";
+  if (career.championships > career.careerYear) return "championships_exceed_career_year";
+  if (career.gamesPlayed === 0 && (career.yards > 0 || career.touchdowns > 0)) return "stats_without_games";
+  if (career.yards > career.gamesPlayed * 650) return "yards_exceed_game_ceiling";
+  if (career.touchdowns > career.gamesPlayed * 10) return "touchdowns_exceed_game_ceiling";
+  const scoreCeiling = Math.round(
+    career.overall * 2 + career.touchdowns * 1.5 + career.yards * 0.04 +
+    career.championships * 100 + Math.log10(Math.max(1, career.followers)) * 50 + 1_000
+  );
+  if (career.legacyScore > scoreCeiling) return "legacy_score_exceeds_aggregate_ceiling";
+  if (career.leaderboardOptIn && !/^[\p{L}\p{N} .'-]+$/u.test(career.displayName)) return "display_name_not_allowed";
+  return null;
 }
 
 export function parseLeaderboardQuery(query) {

@@ -3,9 +3,12 @@ import cors from "cors";
 import express from "express";
 import { rateLimit } from "express-rate-limit";
 import helmet from "helmet";
+import { adminDashboardCss, adminDashboardJs, renderAdminDashboard } from "./adminDashboard.js";
 import { createDatabase } from "./database.js";
 import {
+  assessCareerPlausibility,
   parseLeaderboardQuery,
+  validateAppVersion,
   validateCareer,
   validateEvents,
   validateInstallation
@@ -25,6 +28,19 @@ function secureEqual(left, right) {
 function bearerToken(req) {
   const value = req.get("authorization");
   return value?.startsWith("Bearer ") ? value.slice(7).trim() : null;
+}
+
+function basicCredentials(req) {
+  const value = req.get("authorization");
+  if (!value?.startsWith("Basic ")) return null;
+  try {
+    const decoded = Buffer.from(value.slice(6), "base64").toString("utf8");
+    const separator = decoded.indexOf(":");
+    if (separator < 1) return null;
+    return { username: decoded.slice(0, separator), password: decoded.slice(separator + 1) };
+  } catch {
+    return null;
+  }
 }
 
 export function createApp({ database = createDatabase(), env = process.env } = {}) {
@@ -48,7 +64,8 @@ export function createApp({ database = createDatabase(), env = process.env } = {
     try {
       const token = bearerToken(req);
       if (!token || token.length < 32 || token.length > 200) return res.status(401).json({ error: "Unauthorized" });
-      const installation = await database.findInstallationByTokenHash(tokenHash(token));
+      const appVersion = validateAppVersion(req.get("x-app-version"));
+      const installation = await database.findInstallationByTokenHash(tokenHash(token), appVersion);
       if (!installation) return res.status(401).json({ error: "Unauthorized" });
       req.installation = installation;
       next();
@@ -59,10 +76,26 @@ export function createApp({ database = createDatabase(), env = process.env } = {
 
   function requireAdmin(req, res, next) {
     const configuredKey = env.ADMIN_API_KEY;
-    if (!configuredKey || !secureEqual(bearerToken(req), configuredKey)) {
-      return res.status(401).json({ error: "Unauthorized" });
-    }
-    next();
+    if (configuredKey && secureEqual(bearerToken(req), configuredKey)) return next();
+    const basic = basicCredentials(req);
+    if (
+      basic && env.ADMIN_DASHBOARD_USER && env.ADMIN_DASHBOARD_PASSWORD &&
+      secureEqual(basic.username, env.ADMIN_DASHBOARD_USER) &&
+      secureEqual(basic.password, env.ADMIN_DASHBOARD_PASSWORD)
+    ) return next();
+    res.set("WWW-Authenticate", 'Basic realm="Football Era developer dashboard", charset="UTF-8"');
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  function requireDashboard(req, res, next) {
+    const basic = basicCredentials(req);
+    if (
+      basic && env.ADMIN_DASHBOARD_USER && env.ADMIN_DASHBOARD_PASSWORD &&
+      secureEqual(basic.username, env.ADMIN_DASHBOARD_USER) &&
+      secureEqual(basic.password, env.ADMIN_DASHBOARD_PASSWORD)
+    ) return next();
+    res.set("WWW-Authenticate", 'Basic realm="Football Era developer dashboard", charset="UTF-8"');
+    return res.status(401).send("Authentication required");
   }
 
   app.get("/health", async (_req, res, next) => {
@@ -125,7 +158,15 @@ export function createApp({ database = createDatabase(), env = process.env } = {
     try {
       const career = validateCareer({ ...req.body, careerId: req.params.careerId });
       if (!career) return res.status(400).json({ error: "Invalid career payload" });
-      await database.upsertCareer(req.installation.id, career);
+      const plausibilityReason = assessCareerPlausibility(career);
+      if (plausibilityReason) {
+        await database.recordRejectedCareer(req.installation.id, career.careerId, plausibilityReason, career);
+        return res.status(422).json({ error: "Career snapshot rejected", reason: plausibilityReason });
+      }
+      const result = await database.upsertCareer(req.installation.id, career);
+      if (result?.accepted === false) {
+        return res.status(422).json({ error: "Career snapshot rejected", reason: result.reason });
+      }
       return res.status(204).end();
     } catch (error) {
       next(error);
@@ -184,6 +225,45 @@ export function createApp({ database = createDatabase(), env = process.env } = {
     } catch (error) {
       next(error);
     }
+  });
+
+  app.get("/api/v1/admin/stats/funnel", requireAdmin, async (_req, res, next) => {
+    try {
+      const steps = await database.getFunnel();
+      res.json({ steps });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/api/v1/admin/stats/balance", requireAdmin, async (_req, res, next) => {
+    try {
+      const positions = await database.getBalance();
+      res.json({ positions });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/api/v1/admin/stats/leaderboard-health", requireAdmin, async (_req, res, next) => {
+    try {
+      res.json(await database.getLeaderboardHealth());
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/admin", requireDashboard, (_req, res) => {
+    res.set("Cache-Control", "no-store");
+    res.type("html").send(renderAdminDashboard());
+  });
+  app.get("/admin/dashboard.css", requireDashboard, (_req, res) => {
+    res.set("Cache-Control", "private, max-age=300");
+    res.type("css").send(adminDashboardCss);
+  });
+  app.get("/admin/dashboard.js", requireDashboard, (_req, res) => {
+    res.set("Cache-Control", "private, max-age=300");
+    res.type("js").send(adminDashboardJs);
   });
 
   app.use((_req, res) => res.status(404).json({ error: "Not found" }));

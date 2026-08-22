@@ -4,10 +4,10 @@
   "private": true,
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "scripts": {
-    "start": "node src/server.js",
+    "start": "npm run db:migrate && node src/server.js",
     "dev": "node --watch src/server.js",
     "db:migrate": "node scripts/migrate.js",
     "test": "node --test"
@@ -18,5 +18,8 @@
     "express-rate-limit": "^8.1.0",
     "helmet": "^8.1.0",
     "pg": "^8.16.3"
+  },
+  "devDependencies": {
+    "railway": "^3.10.0"
   }
 }

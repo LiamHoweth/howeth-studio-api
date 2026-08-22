@@ -19,15 +19,25 @@ npm run dev
 - Public leaderboard: `GET /api/v1/leaderboards?metric=legacy_score&position=QB`
 - Private overview: `GET /api/v1/admin/stats/overview` (`ADMIN_API_KEY` bearer token)
 - Private retention: `GET /api/v1/admin/stats/retention` (`ADMIN_API_KEY` bearer token)
+- Private career funnel: `GET /api/v1/admin/stats/funnel`
+- Private balance report: `GET /api/v1/admin/stats/balance`
+- Private leaderboard health: `GET /api/v1/admin/stats/leaderboard-health`
+- Private dashboard: `GET /admin` (HTTP Basic using the dashboard credentials)
+
+Leaderboard legacy scores are calculated again on the server. Static ceilings and
+monotonic progression checks reject impossible career totals, and rejection reasons
+are retained without accepting the submitted score into public results.
 
 ## Deploy on Railway
 
 1. Create a Railway project from this backend GitHub repository.
 2. Add a PostgreSQL service.
 3. Add a `DATABASE_URL` reference on the API service pointing to the Postgres service.
-4. Add `ADMIN_API_KEY` with a long random value and `FRONTEND_ORIGIN=https://howethstudio.com,https://www.howethstudio.com`.
+4. Add `ADMIN_API_KEY`, `ADMIN_DASHBOARD_PASSWORD`, and a non-default
+   `ADMIN_DASHBOARD_USER`. Set `FRONTEND_ORIGIN=https://howethstudio.com,https://www.howethstudio.com`.
 5. Railway reads `railway.toml`, runs migrations before deploy, starts the API, and checks `/health`.
 6. Generate a Railway domain, then optionally map `api.howethstudio.com`.
+7. Enable Railway Postgres point-in-time recovery before collecting production events.
 
 Do not expose `ADMIN_API_KEY` to the iOS app or any `EXPO_PUBLIC_` variable.
 

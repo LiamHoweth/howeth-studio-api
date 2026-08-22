@@ -2,6 +2,26 @@ import pg from "pg";
 
 const { Pool } = pg;
 
+function verifiedLegacyScore(career) {
+  return Math.max(0, Math.round(
+    career.overall * 1.2 + career.touchdowns * 0.9 + career.yards * 0.02 +
+    career.championships * 55 + Math.log10(Math.max(1, career.followers)) * 25
+  ));
+}
+
+function progressionRejection(existing, career) {
+  if (!existing) return null;
+  if (career.clientUpdatedAt < new Date(existing.client_updated_at).toISOString()) return "stale_snapshot";
+  if (career.careerYear < existing.career_year || career.gamesPlayed < existing.games_played) return "career_progress_reversed";
+  if (career.yards < existing.yards || career.touchdowns < existing.touchdowns || career.championships < existing.championships) return "career_totals_reversed";
+  const addedGames = career.gamesPlayed - existing.games_played;
+  if (career.yards - existing.yards > addedGames * 650) return "yards_jump_exceeds_games";
+  if (career.touchdowns - existing.touchdowns > addedGames * 10) return "touchdown_jump_exceeds_games";
+  if (career.championships - existing.championships > Math.max(1, career.careerYear - existing.career_year)) return "championship_jump_exceeds_years";
+  if (career.overall - existing.overall > Math.max(20, addedGames * 2)) return "overall_jump_implausible";
+  return null;
+}
+
 export function createDatabase(connectionString = process.env.DATABASE_URL) {
   const pool = connectionString ? new Pool({ connectionString }) : null;
 
@@ -24,13 +44,13 @@ export function createDatabase(connectionString = process.env.DATABASE_URL) {
       return result.rows[0];
     },
 
-    async findInstallationByTokenHash(tokenHash) {
+    async findInstallationByTokenHash(tokenHash, appVersion) {
       const result = await pool.query(
         `UPDATE installations
-         SET last_seen_at = now()
+         SET last_seen_at = now(), app_version = COALESCE($2, app_version)
          WHERE token_hash = $1
          RETURNING id, platform, app_version`,
-        [tokenHash]
+        [tokenHash, appVersion]
       );
       return result.rows[0] ?? null;
     },
@@ -60,14 +80,47 @@ export function createDatabase(connectionString = process.env.DATABASE_URL) {
       }
     },
 
-    async upsertCareer(installationId, career) {
+    async recordRejectedCareer(installationId, careerId, reason, career = {}) {
       await pool.query(
+        `INSERT INTO leaderboard_submission_audits (
+           installation_id, career_id, reason, games_played, yards, touchdowns,
+           championships, overall, legacy_score
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+        [installationId, careerId, reason, career.gamesPlayed ?? null, career.yards ?? null,
+          career.touchdowns ?? null, career.championships ?? null, career.overall ?? null,
+          career.legacyScore ?? null]
+      );
+    },
+
+    async upsertCareer(installationId, career) {
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        const current = await client.query(
+          `SELECT career_year, games_played, yards, touchdowns, championships, overall, client_updated_at
+           FROM career_snapshots WHERE installation_id = $1 AND career_id = $2 FOR UPDATE`,
+          [installationId, career.careerId]
+        );
+        const reason = progressionRejection(current.rows[0], career);
+        if (reason) {
+          await client.query(
+            `INSERT INTO leaderboard_submission_audits (
+               installation_id, career_id, reason, games_played, yards, touchdowns,
+               championships, overall, legacy_score
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+            [installationId, career.careerId, reason, career.gamesPlayed, career.yards,
+              career.touchdowns, career.championships, career.overall, career.legacyScore]
+          );
+          await client.query("COMMIT");
+          return { accepted: false, reason };
+        }
+        await client.query(
         `INSERT INTO career_snapshots (
            installation_id, career_id, display_name, leaderboard_opt_in, position, team_id,
            season_year, career_year, games_played, yards, touchdowns, championships,
-           overall, followers, net_worth, legacy_score, retired, client_updated_at
+           overall, followers, net_worth, legacy_score, verified_legacy_score, retired, client_updated_at
          ) VALUES (
-           $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18
+           $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19
          )
          ON CONFLICT (installation_id, career_id) DO UPDATE SET
            display_name = EXCLUDED.display_name,
@@ -84,6 +137,7 @@ export function createDatabase(connectionString = process.env.DATABASE_URL) {
            followers = EXCLUDED.followers,
            net_worth = EXCLUDED.net_worth,
            legacy_score = EXCLUDED.legacy_score,
+           verified_legacy_score = EXCLUDED.verified_legacy_score,
            retired = EXCLUDED.retired,
            client_updated_at = EXCLUDED.client_updated_at,
            updated_at = now()
@@ -105,10 +159,19 @@ export function createDatabase(connectionString = process.env.DATABASE_URL) {
           career.followers,
           career.netWorth,
           career.legacyScore,
+          verifiedLegacyScore(career),
           career.retired,
           career.clientUpdatedAt
         ]
       );
+        await client.query("COMMIT");
+        return { accepted: true };
+      } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+      } finally {
+        client.release();
+      }
     },
 
     async deleteInstallation(installationId) {
@@ -117,7 +180,7 @@ export function createDatabase(connectionString = process.env.DATABASE_URL) {
 
     async getLeaderboard({ metric, position, limit }) {
       const metricColumn = {
-        legacy_score: "legacy_score",
+        legacy_score: "verified_legacy_score",
         yards: "yards",
         touchdowns: "touchdowns",
         championships: "championships",
@@ -131,7 +194,7 @@ export function createDatabase(connectionString = process.env.DATABASE_URL) {
       const result = await pool.query(
         `SELECT display_name, position, team_id, ${metricColumn} AS score, updated_at
          FROM career_snapshots
-         WHERE leaderboard_opt_in = true ${positionFilter}
+         WHERE leaderboard_opt_in = true AND display_name IS NOT NULL ${positionFilter}
          ORDER BY ${metricColumn} DESC, updated_at ASC
          LIMIT ${limitParam}`,
         params
@@ -148,7 +211,8 @@ export function createDatabase(connectionString = process.env.DATABASE_URL) {
           (SELECT count(*)::int FROM installations WHERE last_seen_at >= now() - interval '30 days') AS mau,
           (SELECT count(*)::int FROM analytics_events) AS events,
           (SELECT count(*)::int FROM career_snapshots) AS careers,
-          (SELECT count(*)::int FROM career_snapshots WHERE leaderboard_opt_in = true) AS public_careers
+          (SELECT count(*)::int FROM career_snapshots WHERE leaderboard_opt_in = true) AS public_careers,
+          (SELECT app_version FROM installations GROUP BY app_version ORDER BY count(*) DESC, app_version DESC LIMIT 1) AS current_app_version
       `);
       return result.rows[0];
     },
@@ -201,6 +265,89 @@ export function createDatabase(connectionString = process.env.DATABASE_URL) {
         ORDER BY 1
       `);
       return { ...summary.rows[0], daily: daily.rows };
+    },
+
+    async getFunnel() {
+      const result = await pool.query(`
+        WITH event_counts AS (
+          SELECT event_name, count(DISTINCT installation_id)::int AS installations
+          FROM analytics_events
+          WHERE event_name IN ('career_started','week_completed','season_completed','career_retired')
+          GROUP BY event_name
+        ), total AS (SELECT count(*)::int AS installations FROM installations)
+        SELECT stage, label, count FROM (
+          SELECT 1 AS stage, 'Installed' AS label, (SELECT installations FROM total) AS count
+          UNION ALL SELECT 2, 'Career started', COALESCE((SELECT installations FROM event_counts WHERE event_name='career_started'),0)
+          UNION ALL SELECT 3, 'Week completed', COALESCE((SELECT installations FROM event_counts WHERE event_name='week_completed'),0)
+          UNION ALL SELECT 4, 'Season completed', COALESCE((SELECT installations FROM event_counts WHERE event_name='season_completed'),0)
+          UNION ALL SELECT 5, 'Career retired', COALESCE((SELECT installations FROM event_counts WHERE event_name='career_retired'),0)
+        ) steps ORDER BY stage
+      `);
+      const installed = Number(result.rows[0]?.count ?? 0);
+      return result.rows.map((row) => ({
+        stage: row.stage,
+        label: row.label,
+        installations: Number(row.count),
+        conversion: installed > 0 ? Number((Number(row.count) / installed).toFixed(4)) : null
+      }));
+    },
+
+    async getBalance() {
+      const result = await pool.query(`
+        WITH career AS (
+          SELECT position, count(*)::int AS careers,
+                 avg(games_played)::float AS avg_games,
+                 avg(yards)::float AS avg_yards,
+                 avg(touchdowns)::float AS avg_touchdowns,
+                 avg(overall)::float AS avg_overall
+          FROM career_snapshots GROUP BY position
+        ), games AS (
+          SELECT properties->>'position' AS position,
+                 avg(CASE WHEN (properties->>'won')::boolean THEN 1.0 ELSE 0.0 END)::float AS win_rate
+          FROM analytics_events WHERE event_name='week_completed' GROUP BY 1
+        )
+        SELECT career.*, games.win_rate FROM career LEFT JOIN games USING (position)
+        ORDER BY career.position
+      `);
+      return result.rows;
+    },
+
+    async getLeaderboardHealth() {
+      const summary = await pool.query(`
+        SELECT
+          (SELECT count(*)::int FROM career_snapshots WHERE leaderboard_opt_in=true) AS public_careers,
+          (SELECT count(*)::int FROM career_snapshots WHERE leaderboard_opt_in=true AND updated_at >= now()-interval '7 days') AS active_public_careers,
+          (SELECT count(*)::int FROM leaderboard_submission_audits WHERE submitted_at >= now()-interval '24 hours') AS rejected_24h,
+          (SELECT count(*)::int FROM leaderboard_submission_audits) AS rejected_total
+      `);
+      const reasons = await pool.query(`
+        SELECT reason, count(*)::int AS count FROM leaderboard_submission_audits
+        GROUP BY reason ORDER BY count(*) DESC, reason LIMIT 12
+      `);
+      return { ...summary.rows[0], rejection_reasons: reasons.rows };
+    },
+
+    async purgeExpiredData() {
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        const audits = await client.query(
+          "DELETE FROM leaderboard_submission_audits WHERE submitted_at < now() - interval '90 days'"
+        );
+        const events = await client.query(
+          "DELETE FROM analytics_events WHERE occurred_at < now() - interval '13 months'"
+        );
+        const installations = await client.query(
+          "DELETE FROM installations WHERE last_seen_at < now() - interval '24 months'"
+        );
+        await client.query("COMMIT");
+        return { audits: audits.rowCount, events: events.rowCount, installations: installations.rowCount };
+      } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+      } finally {
+        client.release();
+      }
     },
 
     async close() {
