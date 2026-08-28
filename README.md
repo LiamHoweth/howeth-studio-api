@@ -1,6 +1,6 @@
 # Howeth Studio API
 
-Railway-ready Express + PostgreSQL API for the Howeth Studio site and Football Era. Football Era stays local-first and playable as a guest. Anonymous analytics remain separate from optional Apple/Google accounts; signed-in accounts receive cloud career slots and automatically publish verified career summaries to the online leaderboards.
+Railway-ready Express + PostgreSQL API for the Howeth Studio site and Football Era. Football Era stays local-first and playable as a guest. Anonymous analytics remain separate from optional Apple/Google accounts; signed-in accounts receive cloud career slots and automatically publish validated career summaries under server-generated public aliases. User-entered career names are never displayed on the online leaderboards.
 
 ## Run locally
 
