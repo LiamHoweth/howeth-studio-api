@@ -5,6 +5,8 @@ import { rateLimit } from "express-rate-limit";
 import helmet from "helmet";
 import { adminDashboardCss, adminDashboardJs, renderAdminDashboard } from "./adminDashboard.js";
 import { createDatabase } from "./database.js";
+import { createElevenwardDatabase } from "./elevenwardDatabase.js";
+import { createElevenwardRouter } from "./elevenwardRoutes.js";
 import { createProviderAuth } from "./providerAuth.js";
 import {
   assessCareerPlausibility,
@@ -52,7 +54,15 @@ function basicCredentials(req) {
 export function createApp({
   database = createDatabase(),
   env = process.env,
-  providerAuth = createProviderAuth(env)
+  providerAuth = createProviderAuth(env),
+  elevenwardDatabase = createElevenwardDatabase(),
+  elevenwardProviderAuth = createProviderAuth({
+    ...env,
+    APPLE_CLIENT_ID: env.ELEVENWARD_APPLE_CLIENT_ID,
+    GOOGLE_OAUTH_CLIENT_IDS: env.ELEVENWARD_GOOGLE_OAUTH_CLIENT_IDS
+  }),
+  elevenwardContentStore,
+  elevenwardContentSigner
 } = {}) {
   const app = express();
   const frontendOrigins = (env.FRONTEND_ORIGIN || "")
@@ -65,12 +75,25 @@ export function createApp({
   app.use(helmet());
   app.use(cors({ origin: frontendOrigins.length ? frontendOrigins : false }));
   app.use("/api/v2/save-slots", express.json({ limit: "6mb" }));
+  app.use("/v1/elevenward", express.json({ limit: "6mb" }));
   app.use(express.json({ limit: "64kb" }));
 
   const apiLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 300, standardHeaders: "draft-8", legacyHeaders: false });
   const registrationLimiter = rateLimit({ windowMs: 60 * 60_000, limit: 20, standardHeaders: "draft-8", legacyHeaders: false });
   const authLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 30, standardHeaders: "draft-8", legacyHeaders: false });
+  const sensitiveLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 12, standardHeaders: "draft-8", legacyHeaders: false });
   app.use("/api/", apiLimiter);
+  app.use("/v1/elevenward", apiLimiter);
+  app.use("/v1/elevenward/auth", authLimiter);
+  app.use("/v1/elevenward/account/deletion-confirm", sensitiveLimiter);
+
+  app.use("/v1/elevenward", createElevenwardRouter({
+    database: elevenwardDatabase,
+    env,
+    providerAuth: elevenwardProviderAuth,
+    ...(elevenwardContentStore ? { contentStore: elevenwardContentStore } : {}),
+    ...(elevenwardContentSigner ? { contentSigner: elevenwardContentSigner } : {})
+  }));
 
   async function requireInstallation(req, res, next) {
     try {

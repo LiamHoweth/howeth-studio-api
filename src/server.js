@@ -1,13 +1,17 @@
 import { createApp } from "./app.js";
 import { createDatabase } from "./database.js";
+import { createElevenwardDatabase } from "./elevenwardDatabase.js";
 
 const port = Number(process.env.PORT) || 8787;
 const database = createDatabase();
-const app = createApp({ database });
+const elevenwardDatabase = createElevenwardDatabase();
+const app = createApp({ database, elevenwardDatabase });
 
 void database.purgeExpiredData().catch((error) => console.error("Retention cleanup failed", error));
+void elevenwardDatabase.purgeExpiredData().catch((error) => console.error("Elevenward retention cleanup failed", error));
 const cleanup = setInterval(() => {
   void database.purgeExpiredData().catch((error) => console.error("Retention cleanup failed", error));
+  void elevenwardDatabase.purgeExpiredData().catch((error) => console.error("Elevenward retention cleanup failed", error));
 }, 24 * 60 * 60 * 1000);
 cleanup.unref();
 
