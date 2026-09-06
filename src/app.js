@@ -26,6 +26,15 @@ function tokenHash(token) {
   return createHash("sha256").update(token).digest("hex");
 }
 
+function leaderboardAlias(ownerId, careerId, position) {
+  const suffix = createHash("sha256")
+    .update(`${ownerId}:${careerId}`)
+    .digest("hex")
+    .slice(0, 6)
+    .toUpperCase();
+  return `${position} Player ${suffix}`;
+}
+
 function secureEqual(left, right) {
   if (typeof left !== "string" || typeof right !== "string") return false;
   const a = Buffer.from(left);
@@ -297,7 +306,11 @@ export function createApp({
         await database.recordRejectedAccountCareer(req.account.id, career.careerId, plausibilityReason, career);
         return res.status(422).json({ error: "Career snapshot rejected", reason: plausibilityReason });
       }
-      const result = await database.upsertAccountCareer(req.account.id, career);
+      const publishedCareer = {
+        ...career,
+        displayName: leaderboardAlias(req.account.id, career.careerId, career.position)
+      };
+      const result = await database.upsertAccountCareer(req.account.id, publishedCareer);
       if (result?.accepted === false) {
         return res.status(422).json({ error: "Career snapshot rejected", reason: result.reason });
       }
@@ -359,7 +372,13 @@ export function createApp({
         await database.recordRejectedCareer(req.installation.id, career.careerId, plausibilityReason, career);
         return res.status(422).json({ error: "Career snapshot rejected", reason: plausibilityReason });
       }
-      const result = await database.upsertCareer(req.installation.id, career);
+      const publishedCareer = career.leaderboardOptIn
+        ? {
+            ...career,
+            displayName: leaderboardAlias(req.installation.id, career.careerId, career.position)
+          }
+        : career;
+      const result = await database.upsertCareer(req.installation.id, publishedCareer);
       if (result?.accepted === false) {
         return res.status(422).json({ error: "Career snapshot rejected", reason: result.reason });
       }

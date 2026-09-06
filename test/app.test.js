@@ -251,7 +251,8 @@ describe("Football Era API", () => {
     });
     assert.equal(response.status, 204);
     assert.equal(calls.accountCareers.at(-1).career.leaderboardOptIn, true);
-    assert.equal(calls.accountCareers.at(-1).career.displayName, "Account Player");
+    assert.match(calls.accountCareers.at(-1).career.displayName, /^QB Player [A-F0-9]{6}$/);
+    assert.notEqual(calls.accountCareers.at(-1).career.displayName, "Account Player");
   });
 
   it("deletes account-owned server data", async () => {
@@ -354,6 +355,29 @@ describe("Football Era API", () => {
     });
     assert.equal(response.status, 204);
     assert.equal(calls.careers.at(-1).career.displayName, null);
+  });
+
+  it("replaces opted-in legacy names with a stable public alias", async () => {
+    const payload = {
+      displayName: "Player Entered Name", leaderboardOptIn: true, position: "RB",
+      teamId: "AUS", seasonYear: 2026, careerYear: 1, gamesPlayed: 3,
+      yards: 250, touchdowns: 2, championships: 0, overall: 70,
+      followers: 100, netWorth: 1000, legacyScore: 90, retired: false,
+      clientUpdatedAt: new Date().toISOString()
+    };
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const response = await fetch(`${origin}/api/v1/careers/CAREER_ALIAS`, {
+        method: "PUT",
+        headers: { authorization: `Bearer ${"a".repeat(43)}`, "content-type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      assert.equal(response.status, 204);
+    }
+    const latest = calls.careers.at(-1).career.displayName;
+    const previous = calls.careers.at(-2).career.displayName;
+    assert.match(latest, /^RB Player [A-F0-9]{6}$/);
+    assert.equal(latest, previous);
+    assert.notEqual(latest, payload.displayName);
   });
 
   it("rejects implausible leaderboard totals and records the reason", async () => {
