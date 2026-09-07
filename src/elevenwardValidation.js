@@ -2,8 +2,29 @@ import { createHash } from "node:crypto";
 
 export const ELEVENWARD_POSITIONS = new Set(["striker", "winger", "midfielder", "defender"]);
 export const ELEVENWARD_DIFFICULTIES = new Set(["story", "balanced", "elite"]);
-export const ELEVENWARD_ENTITLEMENTS = new Set(["extra_career_slots", "supporter_pack"]);
+export const ELEVENWARD_ENTITLEMENTS = new Set([
+  "extra_career_slots",
+  "supporter_pack",
+  "vip_starter_pack",
+  "double_development",
+  "double_money",
+  "all_access"
+]);
 export const ELEVENWARD_LOCALES = ["en", "es", "pt-BR", "fr"];
+
+const ELEVENWARD_PRODUCTS = new Map([
+  ["extra_career_slots", "com.howethstudio.elevenward.extra_slots"],
+  ["supporter_pack", "com.howethstudio.elevenward.supporter_pack"],
+  ["vip_starter_pack", "com.howethstudio.elevenward.vip"],
+  ["double_development", "com.howethstudio.elevenward.double_development"],
+  ["double_money", "com.howethstudio.elevenward.double_money"],
+  ["all_access", "com.howethstudio.elevenward.all_access"]
+]);
+
+const ELEVENWARD_BOOST_IDS = new Set(["vip", "doubleDevelopment", "doubleMoney", "allAccess"]);
+const ELEVENWARD_ATTRIBUTES = new Set([
+  "pace", "technique", "passing", "finishing", "defending", "strength", "stamina", "composure"
+]);
 
 const ANALYTICS_EVENTS = {
   app_started: [],
@@ -109,15 +130,44 @@ export function validateLeaderboardSubmission(body) {
   const evidenceSeed = int(body.validationEvidence.seed, Number.MIN_SAFE_INTEGER, Number.MAX_SAFE_INTEGER);
   const finalRevision = int(body.validationEvidence.finalRevision, 1, Number.MAX_SAFE_INTEGER);
   const checksum = cleanText(body.validationEvidence.snapshotChecksum, 64, 64);
+  const rawBoostIds = body.validationEvidence.boostIdsUsed ?? [];
+  const rawDevelopmentProgress = body.validationEvidence.developmentProgress ?? {};
   if (!careerId || !ELEVENWARD_POSITIONS.has(position) || !ELEVENWARD_DIFFICULTIES.has(difficulty) ||
       !rulesVersion || seasons == null || matches == null || legacyScore == null || goals == null ||
       assists == null || trophies == null || evidenceSeed == null || finalRevision == null ||
       !checksum || !/^[a-f0-9]{64}$/.test(checksum)) return null;
+  if (!Array.isArray(rawBoostIds) || rawBoostIds.length > 3 || !object(rawDevelopmentProgress)) return null;
+  const boostIdsUsed = rawBoostIds.map((value) => cleanText(value, 1, 32));
+  if (boostIdsUsed.some((value) => !value || !ELEVENWARD_BOOST_IDS.has(value)) ||
+      new Set(boostIdsUsed).size !== boostIdsUsed.length ||
+      (boostIdsUsed.includes("allAccess") && boostIdsUsed.length !== 1)) return null;
+  const progressEntries = Object.entries(rawDevelopmentProgress);
+  if (progressEntries.length > ELEVENWARD_ATTRIBUTES.size) return null;
+  const developmentProgress = {};
+  for (const [attribute, value] of progressEntries) {
+    if (!ELEVENWARD_ATTRIBUTES.has(attribute) || typeof value !== "number" ||
+        !Number.isFinite(value) || value < 0 || value >= 1) return null;
+    developmentProgress[attribute] = value;
+  }
   return {
     careerId, position, difficulty, rulesVersion, seasons, matches, legacyScore,
     aggregateMetrics: { seasons, matches, legacyScore, goals, assists, trophies },
-    validationEvidence: { seed: evidenceSeed, finalRevision, snapshotChecksum: checksum }
+    validationEvidence: {
+      seed: evidenceSeed,
+      finalRevision,
+      snapshotChecksum: checksum,
+      boostIdsUsed,
+      developmentProgress
+    }
   };
+}
+
+function leaderboardBoostCeiling(boostIdsUsed) {
+  if (boostIdsUsed.includes("allAccess")) return 3;
+  const vip = boostIdsUsed.includes("vip") ? 1.5 : 1;
+  const development = vip * (boostIdsUsed.includes("doubleDevelopment") ? 2 : 1);
+  const money = vip * (boostIdsUsed.includes("doubleMoney") ? 2 : 1);
+  return Math.max(development, money);
 }
 
 export function leaderboardRejection(submission) {
@@ -125,7 +175,10 @@ export function leaderboardRejection(submission) {
   if (submission.aggregateMetrics.goals > submission.matches * 8) return "goals_exceed_match_bound";
   if (submission.aggregateMetrics.assists > submission.matches * 8) return "assists_exceed_match_bound";
   if (submission.aggregateMetrics.trophies > submission.seasons * 5) return "trophies_exceed_season_bound";
-  const scoreCeiling = 5000 + submission.matches * 750 + submission.aggregateMetrics.trophies * 10_000;
+  const baseScoreCeiling = 5000 + submission.matches * 750 + submission.aggregateMetrics.trophies * 10_000;
+  const scoreCeiling = Math.round(
+    baseScoreCeiling * leaderboardBoostCeiling(submission.validationEvidence.boostIdsUsed)
+  );
   if (submission.legacyScore > scoreCeiling) return "legacy_score_implausible";
   return null;
 }
@@ -188,7 +241,8 @@ export function validateRevenueCatEvent(body) {
   const sourceStore = { APP_STORE: "app_store", PLAY_STORE: "play_store", PROMOTIONAL: "promotional" }[raw.store];
   const transactionId = cleanText(raw.transaction_id ?? raw.original_transaction_id, 1, 240);
   const productId = cleanText(raw.product_id, 1, 160);
-  if (!eventId || !eventType || !appUserId || !entitlementId || !sourceStore || !transactionId || !productId) return null;
+  if (!eventId || !eventType || !appUserId || !entitlementId || !sourceStore || !transactionId ||
+      !productId || ELEVENWARD_PRODUCTS.get(entitlementId) !== productId) return null;
   const state = ["CANCELLATION", "REFUND", "EXPIRATION"].includes(eventType)
     ? (eventType === "REFUND" ? "refunded" : eventType === "EXPIRATION" ? "expired" : "revoked")
     : "active";
@@ -235,8 +289,8 @@ export function validateContentBundle(body) {
   } else if (maximumSemver && compareVersion(minimumSemver, maximumSemver) > 0) {
     errors.push("Minimum client version cannot exceed maximum client version.");
   }
-  if (body.metadata.rulesVersion !== "2026.2") {
-    errors.push("Content may only target the executable 2026.2 rules version.");
+  if (!["2026.2", "2026.3"].includes(body.metadata.rulesVersion)) {
+    errors.push("Content may only target the executable 2026.2 or 2026.3 rules version.");
   }
   const ids = new Set();
   for (const [key, exact] of collections) {

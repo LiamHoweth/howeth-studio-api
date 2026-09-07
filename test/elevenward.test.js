@@ -5,7 +5,13 @@ import { after, before, describe, it } from "node:test";
 import { createApp } from "../src/app.js";
 import { createPlayerAlias } from "../src/elevenwardDatabase.js";
 import { prepareContentRelease } from "../src/elevenwardContent.js";
-import { canonicalJson, validateContentBundle, validateSyncRequest } from "../src/elevenwardValidation.js";
+import {
+  canonicalJson,
+  leaderboardRejection,
+  validateContentBundle,
+  validateLeaderboardSubmission,
+  validateSyncRequest
+} from "../src/elevenwardValidation.js";
 
 const account = {
   id: "11111111-1111-4111-8111-111111111111",
@@ -276,6 +282,93 @@ describe("Elevenward isolated API", () => {
     assert.equal(body.entries[0].alias, account.alias);
   });
 
+  it("accepts bounded boost evidence and legitimate boosted leaderboard ranges", () => {
+    const submission = validateLeaderboardSubmission({
+      careerId: "33333333-3333-4333-8333-333333333333",
+      position: "striker",
+      difficulty: "balanced",
+      rulesVersion: "2026.3",
+      aggregateMetrics: {
+        seasons: 1,
+        matches: 20,
+        legacyScore: 42_000,
+        goals: 30,
+        assists: 10,
+        trophies: 0
+      },
+      validationEvidence: {
+        seed: 42,
+        finalRevision: 80,
+        snapshotChecksum: "b".repeat(64),
+        boostIdsUsed: ["vip", "doubleDevelopment", "doubleMoney"],
+        developmentProgress: { finishing: 0.5, pace: 0 }
+      }
+    });
+    assert.ok(submission);
+    assert.equal(leaderboardRejection(submission), null);
+    assert.deepEqual(submission.validationEvidence.boostIdsUsed, [
+      "vip", "doubleDevelopment", "doubleMoney"
+    ]);
+  });
+
+  it("rejects malformed boost evidence and scores above the 3x ceiling", () => {
+    const invalidEvidence = validateLeaderboardSubmission({
+      careerId: "33333333-3333-4333-8333-333333333333",
+      position: "striker",
+      difficulty: "balanced",
+      rulesVersion: "2026.3",
+      aggregateMetrics: { seasons: 1, matches: 20, legacyScore: 10_000 },
+      validationEvidence: {
+        seed: 42,
+        finalRevision: 80,
+        snapshotChecksum: "b".repeat(64),
+        boostIdsUsed: ["allAccess", "vip"],
+        developmentProgress: { finishing: 1 }
+      }
+    });
+    assert.equal(invalidEvidence, null);
+
+    const unknownAttribute = validateLeaderboardSubmission({
+      careerId: "33333333-3333-4333-8333-333333333333",
+      position: "striker",
+      difficulty: "balanced",
+      rulesVersion: "2026.3",
+      aggregateMetrics: { seasons: 1, matches: 20, legacyScore: 10_000 },
+      validationEvidence: {
+        seed: 42,
+        finalRevision: 80,
+        snapshotChecksum: "b".repeat(64),
+        boostIdsUsed: ["vip"],
+        developmentProgress: { shooting: 0.5 }
+      }
+    });
+    assert.equal(unknownAttribute, null);
+
+    const aboveCeiling = validateLeaderboardSubmission({
+      careerId: "33333333-3333-4333-8333-333333333333",
+      position: "striker",
+      difficulty: "balanced",
+      rulesVersion: "2026.3",
+      aggregateMetrics: {
+        seasons: 1,
+        matches: 20,
+        legacyScore: 60_001,
+        goals: 30,
+        assists: 10,
+        trophies: 0
+      },
+      validationEvidence: {
+        seed: 42,
+        finalRevision: 80,
+        snapshotChecksum: "b".repeat(64),
+        boostIdsUsed: ["allAccess"],
+        developmentProgress: {}
+      }
+    });
+    assert.ok(aboveCeiling);
+    assert.equal(leaderboardRejection(aboveCeiling), "legacy_score_implausible");
+  });
+
   it("enforces consent before accepting allowlisted, scrubbed analytics", async () => {
     const event = {
       events: [{
@@ -327,6 +420,43 @@ describe("Elevenward isolated API", () => {
       assert.equal(response.status, 202);
       assert.equal((await response.json()).duplicate, duplicate);
     }
+  });
+
+  it("maps the new permanent gamepass webhook entitlement to its exact product", async () => {
+    const accepted = await fetch(`${origin}/v1/elevenward/webhooks/revenuecat`, {
+      method: "POST",
+      headers: { authorization: "Bearer revenuecat-secret", "content-type": "application/json" },
+      body: JSON.stringify({
+        event: {
+          id: "event-vip",
+          type: "INITIAL_PURCHASE",
+          app_user_id: account.id,
+          entitlement_ids: ["vip_starter_pack"],
+          store: "PLAY_STORE",
+          transaction_id: "transaction-vip",
+          product_id: "com.howethstudio.elevenward.vip",
+          purchased_at_ms: Date.now()
+        }
+      })
+    });
+    assert.equal(accepted.status, 202);
+
+    const mismatched = await fetch(`${origin}/v1/elevenward/webhooks/revenuecat`, {
+      method: "POST",
+      headers: { authorization: "Bearer revenuecat-secret", "content-type": "application/json" },
+      body: JSON.stringify({
+        event: {
+          id: "event-mismatch",
+          type: "INITIAL_PURCHASE",
+          app_user_id: account.id,
+          entitlement_ids: ["all_access"],
+          store: "APP_STORE",
+          transaction_id: "transaction-mismatch",
+          product_id: "com.howethstudio.elevenward.double_money"
+        }
+      })
+    });
+    assert.equal(mismatched.status, 400);
   });
 
   it("validates, stores, signs, publishes, and rolls back complete content", async () => {
