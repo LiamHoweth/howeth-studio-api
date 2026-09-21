@@ -97,9 +97,13 @@ export function createDatabase(connectionString = process.env.DATABASE_URL) {
            VALUES ($1,$2,$3)`,
           [accountId, tokenHash, expiresAt]
         );
-        await client.query("UPDATE accounts SET updated_at = now() WHERE id = $1", [accountId]);
+        const profile = await client.query(
+          `UPDATE accounts SET updated_at = now() WHERE id = $1
+           RETURNING public_profile_id, public_username, username_updated_at, username_suspended_at`,
+          [accountId]
+        );
         await client.query("COMMIT");
-        return { id: accountId, provider: identity.provider, email: verifiedEmail };
+        return { id: accountId, provider: identity.provider, email: verifiedEmail, ...profile.rows[0] };
       } catch (error) {
         await client.query("ROLLBACK");
         throw error;
@@ -116,7 +120,8 @@ export function createDatabase(connectionString = process.env.DATABASE_URL) {
            WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > now()
            RETURNING account_id, expires_at
          )
-         SELECT a.id, ai.provider, ai.verified_email, s.expires_at
+         SELECT a.id, a.public_profile_id, a.public_username, a.username_updated_at,
+                a.username_suspended_at, ai.provider, ai.verified_email, s.expires_at
          FROM active_session s
          JOIN accounts a ON a.id = s.account_id
          JOIN auth_identities ai ON ai.account_id = a.id`,
@@ -143,6 +148,198 @@ export function createDatabase(connectionString = process.env.DATABASE_URL) {
 
     async deleteAccount(accountId) {
       await pool.query("DELETE FROM accounts WHERE id = $1", [accountId]);
+    },
+
+    async setPublicUsername(accountId, username, normalized) {
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        const current = await client.query(
+          `SELECT public_username, username_updated_at, username_suspended_at
+           FROM accounts WHERE id = $1 FOR UPDATE`,
+          [accountId]
+        );
+        if (!current.rowCount) {
+          await client.query("ROLLBACK");
+          return { status: "missing" };
+        }
+        const row = current.rows[0];
+        if (row.username_suspended_at) {
+          await client.query("ROLLBACK");
+          return { status: "suspended" };
+        }
+        if (row.public_username && row.username_updated_at) {
+          const canChangeAt = new Date(new Date(row.username_updated_at).getTime() + 30 * 86_400_000);
+          if (canChangeAt.getTime() > Date.now()) {
+            await client.query("ROLLBACK");
+            return { status: "cooldown", canChangeAt: canChangeAt.toISOString() };
+          }
+        }
+        const updated = await client.query(
+          `UPDATE accounts SET public_username = $2, public_username_normalized = $3,
+             username_updated_at = now(), updated_at = now()
+           WHERE id = $1
+           RETURNING public_profile_id, public_username, username_updated_at, username_suspended_at`,
+          [accountId, username, normalized]
+        );
+        await client.query(
+          "UPDATE account_career_snapshots SET display_name = $2, updated_at = now() WHERE account_id = $1",
+          [accountId, username]
+        );
+        await client.query("COMMIT");
+        return { status: "updated", account: updated.rows[0] };
+      } catch (error) {
+        await client.query("ROLLBACK");
+        if (error?.code === "23505") return { status: "taken" };
+        throw error;
+      } finally {
+        client.release();
+      }
+    },
+
+    async createFeedback(feedback) {
+      const result = await pool.query(
+        `INSERT INTO feedback_submissions
+           (id, category, message, contact_email, source, platform, app_version)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)
+         ON CONFLICT (id) DO NOTHING
+         RETURNING id, created_at`,
+        [feedback.submissionId, feedback.category, feedback.message, feedback.contactEmail,
+          feedback.source, feedback.platform, feedback.appVersion]
+      );
+      return result.rows[0] ?? null;
+    },
+
+    async getFeedback({ status = null, limit = 50 } = {}) {
+      const params = status ? [status, limit] : [limit];
+      const where = status ? "WHERE status = $1" : "";
+      const limitParam = status ? "$2" : "$1";
+      const result = await pool.query(
+        `SELECT id, category, message, contact_email, source, platform, app_version,
+                status, created_at, updated_at
+         FROM feedback_submissions ${where}
+         ORDER BY created_at DESC LIMIT ${limitParam}`,
+        params
+      );
+      return result.rows;
+    },
+
+    async getFeedbackSummary() {
+      const result = await pool.query(
+        `SELECT count(*)::int AS total,
+                count(*) FILTER (WHERE status = 'new')::int AS unread
+         FROM feedback_submissions`
+      );
+      return result.rows[0];
+    },
+
+    async updateFeedbackStatus(id, status) {
+      const result = await pool.query(
+        `UPDATE feedback_submissions SET status = $2, updated_at = now()
+         WHERE id = $1 RETURNING id, status, updated_at`,
+        [id, status]
+      );
+      return result.rows[0] ?? null;
+    },
+
+    async createUsernameReport(reporterAccountId, profileId, reason) {
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        const target = await client.query(
+          `SELECT id FROM accounts
+           WHERE public_profile_id = $1
+           FOR UPDATE`,
+          [profileId]
+        );
+        if (!target.rowCount) {
+          await client.query("ROLLBACK");
+          return { status: "missing" };
+        }
+        const reportedAccountId = target.rows[0].id;
+        if (reportedAccountId === reporterAccountId) {
+          await client.query("ROLLBACK");
+          return { status: "self" };
+        }
+        const recent = await client.query(
+          `SELECT id FROM leaderboard_username_reports
+           WHERE reporter_account_id = $1 AND reported_account_id = $2
+             AND created_at >= now() - interval '30 days'`,
+          [reporterAccountId, reportedAccountId]
+        );
+        if (recent.rowCount) {
+          await client.query("ROLLBACK");
+          return { status: "duplicate" };
+        }
+        const result = await client.query(
+          `INSERT INTO leaderboard_username_reports
+             (reporter_account_id, reported_account_id, reason)
+           VALUES ($1,$2,$3) RETURNING id, created_at`,
+          [reporterAccountId, reportedAccountId, reason]
+        );
+        await client.query("COMMIT");
+        return { status: "created", report: result.rows[0] };
+      } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+      } finally {
+        client.release();
+      }
+    },
+
+    async getUsernameReports({ status = "new", limit = 50 } = {}) {
+      const result = await pool.query(
+        `SELECT r.id, r.reason, r.status, r.created_at, r.updated_at,
+                target.public_profile_id, target.public_username,
+                target.username_suspended_at
+         FROM leaderboard_username_reports r
+         JOIN accounts target ON target.id = r.reported_account_id
+         WHERE r.status = $1
+         ORDER BY r.created_at ASC LIMIT $2`,
+        [status, limit]
+      );
+      return result.rows;
+    },
+
+    async resolveUsernameReport(reportId, action) {
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        const report = await client.query(
+          "SELECT reported_account_id FROM leaderboard_username_reports WHERE id = $1 FOR UPDATE",
+          [reportId]
+        );
+        if (!report.rowCount) {
+          await client.query("ROLLBACK");
+          return null;
+        }
+        if (action === "suspend") {
+          await client.query(
+            `UPDATE accounts SET username_suspended_at = now(), updated_at = now()
+             WHERE id = $1`,
+            [report.rows[0].reported_account_id]
+          );
+        } else if (action === "restore") {
+          await client.query(
+            `UPDATE accounts SET username_suspended_at = NULL, updated_at = now()
+             WHERE id = $1`,
+            [report.rows[0].reported_account_id]
+          );
+        }
+        const updated = await client.query(
+          `UPDATE leaderboard_username_reports
+           SET status = $2, updated_at = now() WHERE id = $1
+           RETURNING id, status, updated_at`,
+          [reportId, action === "suspend" ? "actioned" : "dismissed"]
+        );
+        await client.query("COMMIT");
+        return updated.rows[0];
+      } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+      } finally {
+        client.release();
+      }
     },
 
     async getCloudSaveSlots(accountId) {
@@ -410,12 +607,23 @@ export function createDatabase(connectionString = process.env.DATABASE_URL) {
         net_worth: "net_worth"
       }[metric];
       const params = position ? [position, limit] : [limit];
-      const positionFilter = position ? "WHERE position = $1" : "";
+      const positionFilter = position ? "WHERE c.position = $1" : "";
       const limitParam = position ? "$2" : "$1";
       const result = await pool.query(
-        `SELECT display_name, position, team_id, ${metricColumn} AS score, updated_at
-         FROM account_career_snapshots ${positionFilter}
-         ORDER BY ${metricColumn} DESC, updated_at ASC
+        `SELECT CASE
+                   WHEN a.public_username IS NOT NULL AND a.username_suspended_at IS NULL
+                     THEN a.public_username
+                   ELSE c.position || ' Player ' || upper(substring(
+                     encode(digest(c.account_id::text || ':' || c.career_id, 'sha256'), 'hex')
+                     FROM 1 FOR 6))
+                END AS display_name,
+                a.public_profile_id, a.id AS account_id,
+                TRUE AS reportable,
+                c.position, c.team_id, c.${metricColumn} AS score, c.updated_at
+         FROM account_career_snapshots c
+         JOIN accounts a ON a.id = c.account_id
+         ${positionFilter}
+         ORDER BY c.${metricColumn} DESC, c.updated_at ASC
          LIMIT ${limitParam}`,
         params
       );
@@ -605,13 +813,21 @@ export function createDatabase(connectionString = process.env.DATABASE_URL) {
         const installations = await client.query(
           "DELETE FROM installations WHERE last_seen_at < now() - interval '24 months'"
         );
+        const feedback = await client.query(
+          "DELETE FROM feedback_submissions WHERE created_at < now() - interval '12 months'"
+        );
+        const usernameReports = await client.query(
+          "DELETE FROM leaderboard_username_reports WHERE created_at < now() - interval '12 months'"
+        );
         await client.query("COMMIT");
         return {
           audits: audits.rowCount,
           accountAudits: accountAudits.rowCount,
           sessions: sessions.rowCount,
           events: events.rowCount,
-          installations: installations.rowCount
+          installations: installations.rowCount,
+          feedback: feedback.rowCount,
+          usernameReports: usernameReports.rowCount
         };
       } catch (error) {
         await client.query("ROLLBACK");

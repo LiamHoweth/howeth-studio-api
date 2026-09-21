@@ -16,8 +16,11 @@ import {
   validateCareer,
   validateCloudSaveSlots,
   validateEvents,
+  validateFeedback,
   validateInstallation,
-  validateProviderCredential
+  validateProviderCredential,
+  validatePublicUsername,
+  validateUsernameReport
 } from "./validation.js";
 
 const ACCOUNT_SESSION_DAYS = 90;
@@ -33,6 +36,23 @@ function leaderboardAlias(ownerId, careerId, position) {
     .slice(0, 6)
     .toUpperCase();
   return `${position} Player ${suffix}`;
+}
+
+function publicAccount(account) {
+  const suspended = Boolean(account.username_suspended_at);
+  const publicUsername = suspended ? null : account.public_username ?? null;
+  const usernameStatus = suspended ? "suspended" : publicUsername ? "active" : "unset";
+  const usernameCanChangeAt = publicUsername && account.username_updated_at
+    ? new Date(new Date(account.username_updated_at).getTime() + 30 * 86_400_000).toISOString()
+    : null;
+  return {
+    id: account.id,
+    provider: account.provider,
+    email: account.email ?? account.verified_email ?? null,
+    publicUsername,
+    usernameStatus,
+    usernameCanChangeAt
+  };
 }
 
 function secureEqual(left, right) {
@@ -91,6 +111,7 @@ export function createApp({
   const registrationLimiter = rateLimit({ windowMs: 60 * 60_000, limit: 20, standardHeaders: "draft-8", legacyHeaders: false });
   const authLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 30, standardHeaders: "draft-8", legacyHeaders: false });
   const sensitiveLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 12, standardHeaders: "draft-8", legacyHeaders: false });
+  const feedbackLimiter = rateLimit({ windowMs: 60 * 60_000, limit: 5, standardHeaders: "draft-8", legacyHeaders: false });
   app.use("/api/", apiLimiter);
   app.use("/v1/elevenward", apiLimiter);
   app.use("/v1/elevenward/auth", authLimiter);
@@ -185,6 +206,17 @@ export function createApp({
     return res.status(202).json({ received: true });
   });
 
+  app.post("/api/v1/feedback", feedbackLimiter, async (req, res, next) => {
+    try {
+      const feedback = validateFeedback(req.body);
+      if (!feedback) return res.status(400).json({ error: "Invalid feedback payload" });
+      const created = await database.createFeedback(feedback);
+      return res.status(created ? 201 : 200).json({ received: true, submissionId: feedback.submissionId });
+    } catch (error) {
+      next(error);
+    }
+  });
+
   app.post("/api/v1/installations", registrationLimiter, async (req, res, next) => {
     try {
       const installation = validateInstallation(req.body);
@@ -216,7 +248,7 @@ export function createApp({
         expiresAt
       });
       return res.status(200).json({
-        account: { id: account.id, provider: account.provider, email: account.email ?? null },
+        account: publicAccount(account),
         accessToken: token,
         expiresAt: expiresAt.toISOString()
       });
@@ -233,13 +265,27 @@ export function createApp({
 
   app.get("/api/v2/account", requireAccount, (req, res) => {
     res.json({
-      account: {
-        id: req.account.id,
-        provider: req.account.provider,
-        email: req.account.verified_email ?? null
-      },
+      account: publicAccount(req.account),
       expiresAt: new Date(req.account.expires_at).toISOString()
     });
+  });
+
+  app.put("/api/v2/account/username", requireAccount, async (req, res, next) => {
+    try {
+      const validation = validatePublicUsername(req.body?.username);
+      if (!validation.ok) return res.status(422).json({ error: validation.reason });
+      const result = await database.setPublicUsername(req.account.id, validation.username, validation.normalized);
+      if (result.status === "taken") return res.status(409).json({ error: "username_taken" });
+      if (result.status === "cooldown") return res.status(429).json({ error: "username_cooldown", usernameCanChangeAt: result.canChangeAt });
+      if (result.status === "suspended") return res.status(403).json({ error: "username_suspended" });
+      if (result.status !== "updated") return res.status(404).json({ error: "account_not_found" });
+      return res.json({
+        account: publicAccount({ ...req.account, ...result.account }),
+        expiresAt: new Date(req.account.expires_at).toISOString()
+      });
+    } catch (error) {
+      next(error);
+    }
   });
 
   app.post("/api/v2/auth/sign-out", requireAccount, async (req, res, next) => {
@@ -308,7 +354,9 @@ export function createApp({
       }
       const publishedCareer = {
         ...career,
-        displayName: leaderboardAlias(req.account.id, career.careerId, career.position)
+        displayName: req.account.public_username && !req.account.username_suspended_at
+          ? req.account.public_username
+          : leaderboardAlias(req.account.id, career.careerId, career.position)
       };
       const result = await database.upsertAccountCareer(req.account.id, publishedCareer);
       if (result?.accepted === false) {
@@ -340,12 +388,28 @@ export function createApp({
         entries: rows.map((row, index) => ({
           rank: index + 1,
           displayName: row.display_name,
+          profileId: row.public_profile_id,
+          isCurrentUser: row.account_id === req.account.id,
+          reportable: Boolean(row.reportable) && row.account_id !== req.account.id,
           position: row.position,
           teamId: row.team_id,
           score: Number(row.score),
           updatedAt: new Date(row.updated_at).toISOString()
         }))
       });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/v2/leaderboard-reports", requireAccount, sensitiveLimiter, async (req, res, next) => {
+    try {
+      const report = validateUsernameReport(req.body);
+      if (!report) return res.status(400).json({ error: "Invalid report payload" });
+      const result = await database.createUsernameReport(req.account.id, report.profileId, report.reason);
+      if (result.status === "self") return res.status(400).json({ error: "cannot_report_self" });
+      if (result.status === "missing") return res.status(404).json({ error: "profile_not_found" });
+      return res.status(result.status === "created" ? 202 : 200).json({ received: true });
     } catch (error) {
       next(error);
     }
@@ -464,6 +528,50 @@ export function createApp({
   app.get("/api/v1/admin/stats/leaderboard-health", requireAdmin, async (_req, res, next) => {
     try {
       res.json(await database.getLeaderboardHealth());
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/api/v1/admin/feedback", requireAdmin, async (req, res, next) => {
+    try {
+      const status = ["new", "reviewed", "resolved"].includes(req.query.status) ? req.query.status : null;
+      const [summary, submissions] = await Promise.all([
+        database.getFeedbackSummary(),
+        database.getFeedback({ status, limit: 100 })
+      ]);
+      return res.json({ summary, submissions });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.patch("/api/v1/admin/feedback/:id", requireAdmin, async (req, res, next) => {
+    try {
+      const status = req.body?.status;
+      if (!["new", "reviewed", "resolved"].includes(status)) return res.status(400).json({ error: "Invalid feedback status" });
+      const updated = await database.updateFeedbackStatus(req.params.id, status);
+      return updated ? res.json(updated) : res.status(404).json({ error: "Feedback not found" });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/api/v1/admin/username-reports", requireAdmin, async (req, res, next) => {
+    try {
+      const status = ["new", "dismissed", "actioned"].includes(req.query.status) ? req.query.status : "new";
+      return res.json({ reports: await database.getUsernameReports({ status, limit: 100 }) });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.patch("/api/v1/admin/username-reports/:id", requireAdmin, async (req, res, next) => {
+    try {
+      const action = req.body?.action;
+      if (!["dismiss", "suspend", "restore"].includes(action)) return res.status(400).json({ error: "Invalid moderation action" });
+      const updated = await database.resolveUsernameReport(req.params.id, action);
+      return updated ? res.json(updated) : res.status(404).json({ error: "Report not found" });
     } catch (error) {
       next(error);
     }
