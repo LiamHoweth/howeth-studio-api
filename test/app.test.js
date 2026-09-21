@@ -1,17 +1,23 @@
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 import { createApp } from "../src/app.js";
+import { validateFeedback, validatePublicUsername, validateUsernameReport } from "../src/validation.js";
 
 const installation = { id: "11111111-1111-4111-8111-111111111111", platform: "ios", app_version: "1.2.0" };
 const account = {
   id: "44444444-4444-4444-8444-444444444444",
   provider: "apple",
   verified_email: "player@example.com",
+  public_profile_id: "55555555-5555-4555-8555-555555555555",
+  public_username: null,
+  username_updated_at: null,
+  username_suspended_at: null,
   expires_at: new Date("2027-01-01T00:00:00Z")
 };
 const calls = {
   events: [], careers: [], rejections: [], accountCareers: [], accountRejections: [],
   accountSessions: [], saveSlots: [], deletedAccounts: [], revokedSessions: [],
+  feedback: [], usernameReports: [], usernameMutations: [],
   expireNextAccountSession: false
 };
 
@@ -35,6 +41,35 @@ const database = {
   async revokeAccountSession(hash) { calls.revokedSessions.push(hash); },
   async getAccountIdentities() { return [{ provider: "apple", apple_refresh_token_ciphertext: "encrypted" }]; },
   async deleteAccount(id) { calls.deletedAccounts.push(id); },
+  async setPublicUsername(accountId, username, normalized) {
+    calls.usernameMutations.push({ accountId, username, normalized });
+    if (normalized === "alreadytaken") return { status: "taken" };
+    if (normalized === "cooldownname") return { status: "cooldown", canChangeAt: "2026-10-21T12:00:00.000Z" };
+    if (normalized === "suspendedname") return { status: "suspended" };
+    return {
+      status: "updated",
+      account: {
+        public_profile_id: account.public_profile_id,
+        public_username: username,
+        username_updated_at: new Date("2026-09-21T12:00:00Z"),
+        username_suspended_at: null
+      }
+    };
+  },
+  async createFeedback(feedback) {
+    const exists = calls.feedback.some((item) => item.submissionId === feedback.submissionId);
+    if (!exists) calls.feedback.push(feedback);
+    return !exists;
+  },
+  async getFeedback() { return calls.feedback; },
+  async getFeedbackSummary() { return { new: calls.feedback.length, reviewed: 0, resolved: 0 }; },
+  async updateFeedbackStatus(id, status) { return { id, status }; },
+  async createUsernameReport(reporterAccountId, profileId, reason) {
+    calls.usernameReports.push({ reporterAccountId, profileId, reason });
+    return { status: "created" };
+  },
+  async getUsernameReports() { return calls.usernameReports; },
+  async resolveUsernameReport(id, action) { return { id, status: action === "suspend" ? "actioned" : "dismissed" }; },
   async getCloudSaveSlots() { return calls.saveSlots; },
   async syncCloudSaveSlots(_accountId, slots) {
     calls.saveSlots = slots.map((slot, index) => ({
@@ -70,6 +105,7 @@ const database = {
   async getAccountLeaderboard() {
     return [{
       display_name: "Account QB", position: "QB", team_id: "AUS", score: 4321,
+      public_profile_id: account.public_profile_id, account_id: account.id, reportable: true,
       updated_at: new Date("2026-08-22T12:00:00Z")
     }];
   },
@@ -175,6 +211,85 @@ describe("Football Era API", () => {
     });
     assert.equal(authorized.status, 200);
     assert.equal((await authorized.json()).entries[0].displayName, "Account QB");
+    const entry = (await (await fetch(`${origin}/api/v2/leaderboards`, {
+      headers: { authorization: `Bearer ${"s".repeat(43)}` }
+    })).json()).entries[0];
+    assert.equal(entry.profileId, account.public_profile_id);
+    assert.equal(entry.isCurrentUser, true);
+    assert.equal(entry.reportable, false);
+  });
+
+  it("claims an account-wide public username", async () => {
+    const response = await fetch(`${origin}/api/v2/account/username`, {
+      method: "PUT",
+      headers: { authorization: `Bearer ${"s".repeat(43)}`, "content-type": "application/json" },
+      body: JSON.stringify({ username: "Fourth_Quarter7" })
+    });
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.account.publicUsername, "Fourth_Quarter7");
+    assert.equal(body.account.usernameStatus, "active");
+    assert.deepEqual(calls.usernameMutations.at(-1), {
+      accountId: account.id, username: "Fourth_Quarter7", normalized: "fourth_quarter7"
+    });
+  });
+
+  it("rejects unsafe username variants before the database", async () => {
+    const response = await fetch(`${origin}/api/v2/account/username`, {
+      method: "PUT",
+      headers: { authorization: `Bearer ${"s".repeat(43)}`, "content-type": "application/json" },
+      body: JSON.stringify({ username: "f00tballera" })
+    });
+    assert.equal(response.status, 422);
+  });
+
+  it("surfaces username uniqueness, cooldown, and suspension states", async () => {
+    for (const [username, expected] of [["AlreadyTaken", 409], ["CooldownName", 429], ["SuspendedName", 403]]) {
+      const response = await fetch(`${origin}/api/v2/account/username`, {
+        method: "PUT",
+        headers: { authorization: `Bearer ${"s".repeat(43)}`, "content-type": "application/json" },
+        body: JSON.stringify({ username })
+      });
+      assert.equal(response.status, expected, username);
+    }
+  });
+
+  it("accepts idempotent anonymous feedback without account identifiers", async () => {
+    const feedback = {
+      submissionId: "66666666-6666-4666-8666-666666666666",
+      category: "feature_idea",
+      message: "Please add more contract negotiation choices.",
+      contactEmail: "player@example.com",
+      source: "settings",
+      platform: "ios",
+      appVersion: "1.4.0"
+    };
+    const first = await fetch(`${origin}/api/v1/feedback`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(feedback)
+    });
+    const second = await fetch(`${origin}/api/v1/feedback`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(feedback)
+    });
+    assert.equal(first.status, 201);
+    assert.equal(second.status, 200);
+    assert.equal(calls.feedback.length, 1);
+    assert.equal(Object.hasOwn(calls.feedback[0], "accountId"), false);
+  });
+
+  it("submits authenticated username reports and protects moderation", async () => {
+    const profileId = "77777777-7777-4777-8777-777777777777";
+    const response = await fetch(`${origin}/api/v2/leaderboard-reports`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${"s".repeat(43)}`, "content-type": "application/json" },
+      body: JSON.stringify({ profileId, reason: "impersonation" })
+    });
+    assert.equal(response.status, 202);
+    assert.deepEqual(calls.usernameReports.at(-1), { reporterAccountId: account.id, profileId, reason: "impersonation" });
+    assert.equal((await fetch(`${origin}/api/v1/admin/username-reports`)).status, 401);
+    const admin = await fetch(`${origin}/api/v1/admin/username-reports`, {
+      headers: { authorization: "Bearer test-admin-key" }
+    });
+    assert.equal(admin.status, 200);
   });
 
   it("rejects an expired or revoked account session", async () => {
@@ -417,5 +532,28 @@ describe("Football Era API", () => {
     });
     assert.equal(authorized.status, 200);
     assert.match(await authorized.text(), /Football Era telemetry/);
+  });
+});
+
+describe("engagement validation", () => {
+  it("normalizes safe usernames and blocks reserved, profane, and malformed variants", () => {
+    assert.deepEqual(validatePublicUsername("  PlayMaker_7 "), {
+      ok: true, username: "PlayMaker_7", normalized: "playmaker_7"
+    });
+    for (const username of ["admin", "f00tballera", "sh1t_talker", "two__underscores", "2fast"]) {
+      assert.equal(validatePublicUsername(username).ok, false, username);
+    }
+  });
+
+  it("strictly validates feedback and report contracts", () => {
+    assert.ok(validateFeedback({
+      submissionId: "88888888-8888-4888-8888-888888888888", category: "bug",
+      message: "The playoff screen became unresponsive.", source: "shop", platform: "ios", appVersion: "1.4.0"
+    }));
+    assert.equal(validateFeedback({ submissionId: "bad", category: "bug", message: "too short" }), null);
+    assert.deepEqual(validateUsernameReport({
+      profileId: "99999999-9999-4999-8999-999999999999", reason: "harassment"
+    }), { profileId: "99999999-9999-4999-8999-999999999999", reason: "harassment" });
+    assert.equal(validateUsernameReport({ profileId: "99999999-9999-4999-8999-999999999999", reason: "free_text" }), null);
   });
 });

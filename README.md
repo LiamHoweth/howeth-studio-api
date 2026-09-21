@@ -1,6 +1,6 @@
 # Howeth Studio API
 
-Railway-ready Express + PostgreSQL API for the Howeth Studio site and Football Era. Football Era stays local-first and playable as a guest. Anonymous analytics remain separate from optional Apple/Google accounts; signed-in accounts receive cloud career slots and automatically publish validated career summaries under server-generated public aliases. User-entered career names are never displayed on the online leaderboards.
+Railway-ready Express + PostgreSQL API for the Howeth Studio site and Football Era. Football Era stays local-first and playable as a guest. Anonymous analytics remain separate from optional Apple/Google accounts; signed-in accounts receive cloud career slots and automatically publish validated career summaries under an optional moderated account username or a stable generated alias. User-entered career names are never displayed on the online leaderboards.
 
 ## Run locally
 
@@ -17,16 +17,21 @@ npm run dev
 - Batched app events: `POST /api/v1/events` (installation bearer token)
 - Career sync: `PUT /api/v1/careers/:careerId` (installation bearer token)
 - Public leaderboard: `GET /api/v1/leaderboards?metric=legacy_score&position=QB`
+- Anonymous player feedback: `POST /api/v1/feedback`
 - Apple/Google sign-in: `POST /api/v2/auth/apple` and `POST /api/v2/auth/google`
 - Account/session: `GET /api/v2/account`, `POST /api/v2/auth/sign-out`, `DELETE /api/v2/account`
+- Public username: `PUT /api/v2/account/username`
 - Cloud career slots: `GET/PUT /api/v2/save-slots` (account bearer token)
 - Account career publication: `PUT/DELETE /api/v2/careers/:careerId`
 - Account leaderboard: `GET /api/v2/leaderboards?metric=legacy_score&position=QB`
+- Username report: `POST /api/v2/leaderboard-reports`
 - Private overview: `GET /api/v1/admin/stats/overview` (`ADMIN_API_KEY` bearer token)
 - Private retention: `GET /api/v1/admin/stats/retention` (`ADMIN_API_KEY` bearer token)
 - Private career funnel: `GET /api/v1/admin/stats/funnel`
 - Private balance report: `GET /api/v1/admin/stats/balance`
 - Private leaderboard health: `GET /api/v1/admin/stats/leaderboard-health`
+- Private feedback: `GET/PATCH /api/v1/admin/feedback...`
+- Private username moderation: `GET/PATCH /api/v1/admin/username-reports...`
 - Private dashboard: `GET /admin` (HTTP Basic using the dashboard credentials)
 
 Leaderboard legacy scores are calculated again on the server. Static ceilings and

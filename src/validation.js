@@ -9,7 +9,8 @@ const EVENT_NAMES = new Set([
   "life_purchase",
   "skill_upgraded",
   "contract_signed",
-  "daily_reward_claimed"
+  "daily_reward_claimed",
+  "review_request_attempted"
 ]);
 
 export const LEADERBOARD_METRICS = {
@@ -32,6 +33,19 @@ const ATTRIBUTES = new Set([
   "catching", "routeRunning", "separation"
 ]);
 const REWARD_TYPES = new Set(["xp", "money", "xp_boost", "money_boost"]);
+const REVIEW_TRIGGERS = new Set(["post_game_win", "championship_win", "retirement"]);
+const FEEDBACK_CATEGORIES = new Set(["feature_idea", "gameplay_balance", "bug", "store_purchase", "other"]);
+const FEEDBACK_SOURCES = new Set(["settings", "shop"]);
+const USERNAME_REPORT_REASONS = new Set(["offensive_username", "impersonation", "harassment", "other"]);
+const RESERVED_USERNAME_KEYS = new Set([
+  "admin", "administrator", "developer", "footballera", "footballeraofficial",
+  "howethstudio", "moderator", "official", "staff", "support"
+]);
+const BLOCKED_USERNAME_PARTS = [
+  "asshole", "bastard", "bitch", "cocksucker", "dick", "faggot", "fuck",
+  "hitler", "kike", "nazi", "nigger", "porn", "pussy", "rape", "retard",
+  "shit", "slut", "whore"
+];
 
 function isObject(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -45,6 +59,59 @@ function text(value, { min = 0, max = 100 } = {}) {
 
 function integer(value, { min = Number.MIN_SAFE_INTEGER, max = Number.MAX_SAFE_INTEGER } = {}) {
   return Number.isInteger(value) && value >= min && value <= max ? value : null;
+}
+
+function usernameSafetyKey(value) {
+  return value.toLowerCase()
+    .replaceAll("0", "o")
+    .replaceAll("1", "i")
+    .replaceAll("3", "e")
+    .replaceAll("4", "a")
+    .replaceAll("5", "s")
+    .replaceAll("7", "t")
+    .replace(/_/g, "");
+}
+
+export function validatePublicUsername(value) {
+  if (typeof value !== "string") return { ok: false, reason: "username_invalid" };
+  const username = value.trim();
+  if (username.length < 3 || username.length > 20) return { ok: false, reason: "username_length" };
+  if (!/^[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)*$/.test(username)) {
+    return { ok: false, reason: "username_format" };
+  }
+  const normalized = username.toLowerCase();
+  const safetyKey = usernameSafetyKey(username);
+  if (RESERVED_USERNAME_KEYS.has(safetyKey)) return { ok: false, reason: "username_reserved" };
+  if (BLOCKED_USERNAME_PARTS.some((part) => safetyKey.includes(part))) {
+    return { ok: false, reason: "username_not_allowed" };
+  }
+  return { ok: true, username, normalized };
+}
+
+export function validateFeedback(body) {
+  if (!isObject(body)) return null;
+  const submissionId = text(body.submissionId, { min: 36, max: 36 });
+  const category = text(body.category, { min: 3, max: 32 });
+  const message = text(body.message, { min: 10, max: 2_000 });
+  const source = text(body.source, { min: 4, max: 16 });
+  const platform = text(body.platform, { min: 2, max: 12 });
+  const appVersion = text(body.appVersion, { min: 1, max: 32 });
+  const contactEmail = body.contactEmail == null || body.contactEmail === ""
+    ? null
+    : text(body.contactEmail, { min: 3, max: 254 });
+  if (!submissionId || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(submissionId)) return null;
+  if (!category || !FEEDBACK_CATEGORIES.has(category) || !message) return null;
+  if (!source || !FEEDBACK_SOURCES.has(source) || !platform || !["ios", "android"].includes(platform) || !appVersion) return null;
+  if (contactEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(contactEmail)) return null;
+  return { submissionId, category, message, contactEmail, source, platform, appVersion };
+}
+
+export function validateUsernameReport(body) {
+  if (!isObject(body)) return null;
+  const profileId = text(body.profileId, { min: 36, max: 36 });
+  const reason = text(body.reason, { min: 3, max: 32 });
+  if (!profileId || !/^[0-9a-f-]{36}$/i.test(profileId) || !reason || !USERNAME_REPORT_REASONS.has(reason)) return null;
+  return { profileId: profileId.toLowerCase(), reason };
 }
 
 const FORBIDDEN_CLOUD_KEYS = new Set([
@@ -199,6 +266,11 @@ function validateEventProperties(name, raw) {
     }
     case "daily_reward_claimed":
       return REWARD_TYPES.has(properties.rewardType) ? { rewardType: properties.rewardType } : null;
+    case "review_request_attempted": {
+      const trigger = text(properties.trigger, { min: 3, max: 32 });
+      const appVersion = text(properties.appVersion, { min: 1, max: 32 });
+      return trigger && REVIEW_TRIGGERS.has(trigger) && appVersion ? { trigger, appVersion } : null;
+    }
     default:
       return null;
   }
