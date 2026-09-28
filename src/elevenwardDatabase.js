@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 import pg from "pg";
+import { leaderboardSubmissionFromSync } from "./elevenwardValidation.js";
 
 const { Pool } = pg;
 
@@ -43,6 +44,23 @@ function conflictResponse(row) {
     createdAt: new Date(row.created_at).toISOString(),
     resolvedAt: row.resolved_at ? new Date(row.resolved_at).toISOString() : null
   };
+}
+
+async function replaceLeaderboardSubmission(client, accountId, careerId, submission) {
+  await client.query(
+    "DELETE FROM elevenward.leaderboard_submissions WHERE account_id=$1 AND career_id=$2",
+    [accountId, careerId]
+  );
+  if (!submission) return;
+  await client.query(
+    `INSERT INTO elevenward.leaderboard_submissions
+       (account_id, career_id, alias, position, difficulty, rules_version, seasons, matches,
+        legacy_score, aggregate_metrics, validation_evidence, accepted, rejection_reason)
+     VALUES ($1,$2,(SELECT alias FROM elevenward.accounts WHERE id=$1),$3,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb,true,NULL)`,
+    [accountId, careerId, submission.position, submission.difficulty,
+      submission.rulesVersion, submission.seasons, submission.matches, submission.legacyScore,
+      JSON.stringify(submission.aggregateMetrics), JSON.stringify(submission.validationEvidence)]
+  );
 }
 
 export function createElevenwardDatabase(connectionString = process.env.DATABASE_URL) {
@@ -105,9 +123,12 @@ export function createElevenwardDatabase(connectionString = process.env.DATABASE
           "INSERT INTO elevenward.sessions (account_id, token_hash, expires_at) VALUES ($1,$2,$3)",
           [accountId, tokenHash, expiresAt]
         );
-        const account = await client.query("SELECT alias FROM elevenward.accounts WHERE id = $1", [accountId]);
+        const account = await client.query(
+          `SELECT alias, public_profile_id, public_username, username_updated_at, username_suspended_at
+           FROM elevenward.accounts WHERE id = $1`, [accountId]
+        );
         await client.query("COMMIT");
-        return { id: accountId, alias: account.rows[0].alias, provider: identity.provider, email };
+        return { id: accountId, ...account.rows[0], provider: identity.provider, email };
       } catch (error) {
         await client.query("ROLLBACK");
         throw error;
@@ -124,7 +145,9 @@ export function createElevenwardDatabase(connectionString = process.env.DATABASE
            WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > now()
            RETURNING account_id, expires_at
          )
-         SELECT a.id, a.alias, i.provider, i.verified_email, active.expires_at
+         SELECT a.id, a.alias, a.public_profile_id, a.public_username,
+                a.username_updated_at, a.username_suspended_at,
+                i.provider, i.verified_email, active.expires_at
          FROM active JOIN elevenward.accounts a ON a.id = active.account_id
          JOIN elevenward.auth_identities i ON i.account_id = a.id
          ORDER BY i.last_login_at DESC LIMIT 1`,
@@ -138,6 +161,136 @@ export function createElevenwardDatabase(connectionString = process.env.DATABASE
         "UPDATE elevenward.sessions SET revoked_at = now() WHERE token_hash = $1 AND revoked_at IS NULL",
         [tokenHash]
       );
+    },
+
+    async setPublicUsername(accountId, username, normalized) {
+      const client = await requirePool().connect();
+      try {
+        await client.query("BEGIN");
+        const current = await client.query(
+          `SELECT public_username, username_updated_at, username_suspended_at
+           FROM elevenward.accounts WHERE id=$1 FOR UPDATE`, [accountId]
+        );
+        if (!current.rowCount) {
+          await client.query("ROLLBACK");
+          return { status: "missing" };
+        }
+        const row = current.rows[0];
+        if (row.username_suspended_at) {
+          await client.query("ROLLBACK");
+          return { status: "suspended" };
+        }
+        if (row.public_username && row.username_updated_at) {
+          const canChangeAt = new Date(new Date(row.username_updated_at).getTime() + 30 * 86_400_000);
+          if (canChangeAt.getTime() > Date.now()) {
+            await client.query("ROLLBACK");
+            return { status: "cooldown", canChangeAt: canChangeAt.toISOString() };
+          }
+        }
+        const updated = await client.query(
+          `UPDATE elevenward.accounts
+           SET public_username=$2, public_username_normalized=$3,
+               username_updated_at=now(), updated_at=now()
+           WHERE id=$1
+           RETURNING public_profile_id, public_username, username_updated_at, username_suspended_at`,
+          [accountId, username, normalized]
+        );
+        await client.query("COMMIT");
+        return { status: "updated", account: updated.rows[0] };
+      } catch (error) {
+        await client.query("ROLLBACK");
+        if (error?.code === "23505") return { status: "taken" };
+        throw error;
+      } finally {
+        client.release();
+      }
+    },
+
+    async createUsernameReport(reporterAccountId, profileId, reason) {
+      const client = await requirePool().connect();
+      try {
+        await client.query("BEGIN");
+        const target = await client.query(
+          `SELECT id FROM elevenward.accounts WHERE public_profile_id=$1 FOR UPDATE`, [profileId]
+        );
+        if (!target.rowCount) {
+          await client.query("ROLLBACK");
+          return { status: "missing" };
+        }
+        const reportedAccountId = target.rows[0].id;
+        if (reportedAccountId === reporterAccountId) {
+          await client.query("ROLLBACK");
+          return { status: "self" };
+        }
+        const recent = await client.query(
+          `SELECT id FROM elevenward.leaderboard_username_reports
+           WHERE reporter_account_id=$1 AND reported_account_id=$2
+             AND created_at >= now() - interval '30 days'`,
+          [reporterAccountId, reportedAccountId]
+        );
+        if (recent.rowCount) {
+          await client.query("ROLLBACK");
+          return { status: "duplicate" };
+        }
+        await client.query(
+          `INSERT INTO elevenward.leaderboard_username_reports
+             (reporter_account_id, reported_account_id, reason) VALUES ($1,$2,$3)`,
+          [reporterAccountId, reportedAccountId, reason]
+        );
+        await client.query("COMMIT");
+        return { status: "created" };
+      } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+      } finally {
+        client.release();
+      }
+    },
+
+    async getUsernameReports({ status = "new", limit = 50 } = {}) {
+      const result = await requirePool().query(
+        `SELECT r.id, r.reason, r.status, r.created_at, r.updated_at,
+                target.public_profile_id, target.public_username, target.username_suspended_at
+         FROM elevenward.leaderboard_username_reports r
+         JOIN elevenward.accounts target ON target.id=r.reported_account_id
+         WHERE r.status=$1 ORDER BY r.created_at ASC LIMIT $2`,
+        [status, limit]
+      );
+      return result.rows;
+    },
+
+    async resolveUsernameReport(reportId, action) {
+      const client = await requirePool().connect();
+      try {
+        await client.query("BEGIN");
+        const report = await client.query(
+          `SELECT reported_account_id FROM elevenward.leaderboard_username_reports
+           WHERE id=$1 FOR UPDATE`, [reportId]
+        );
+        if (!report.rowCount) {
+          await client.query("ROLLBACK");
+          return null;
+        }
+        if (action === "suspend" || action === "restore") {
+          await client.query(
+            `UPDATE elevenward.accounts
+             SET username_suspended_at=CASE WHEN $2 THEN now() ELSE NULL END, updated_at=now()
+             WHERE id=$1`, [report.rows[0].reported_account_id, action === "suspend"]
+          );
+        }
+        const updated = await client.query(
+          `UPDATE elevenward.leaderboard_username_reports
+           SET status=$2, updated_at=now() WHERE id=$1 RETURNING id, status, updated_at`,
+          [reportId, action === "suspend" ? "actioned" : "dismissed"]
+        );
+        await client.query("COMMIT");
+        return updated.rows[0];
+      } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+      } finally {
+        client.release();
+      }
     },
 
     async getAccountIdentities(accountId) {
@@ -244,7 +397,14 @@ export function createElevenwardDatabase(connectionString = process.env.DATABASE
             request.contentVersion, request.position, request.difficulty, request.seed, request.checksum,
             JSON.stringify(request.snapshot), revision, request.updatedAt]
         );
-        const body = { slot: slotResponse(saved.rows[0]) };
+        const projected = request.publishLeaderboard ? leaderboardSubmissionFromSync(request) : null;
+        const body = { slot: slotResponse(saved.rows[0]), leaderboardPublished: Boolean(projected) };
+        if (current && current.career_id !== request.careerId) {
+          await replaceLeaderboardSubmission(client, accountId, current.career_id, null);
+        }
+        await replaceLeaderboardSubmission(
+          client, accountId, request.careerId, projected
+        );
         await client.query(
           `INSERT INTO elevenward.idempotency_keys
              (account_id, idempotency_key, request_hash, response_status, response_body)
@@ -270,7 +430,7 @@ export function createElevenwardDatabase(connectionString = process.env.DATABASE
       return result.rows.map(conflictResponse);
     },
 
-    async resolveConflict(accountId, slotIndex, conflictId, choice, metadataForSnapshot) {
+    async resolveConflict(accountId, slotIndex, conflictId, choice, publishLeaderboard, metadataForSnapshot) {
       const client = await requirePool().connect();
       try {
         await client.query("BEGIN");
@@ -284,6 +444,10 @@ export function createElevenwardDatabase(connectionString = process.env.DATABASE
           return undefined;
         }
         const conflict = result.rows[0];
+        const existing = await client.query(
+          "SELECT career_id FROM elevenward.career_slots WHERE account_id=$1 AND slot_index=$2 FOR UPDATE",
+          [accountId, slotIndex]
+        );
         if (choice === "local") {
           if (conflict.local_snapshot == null) {
             await client.query(
@@ -317,10 +481,26 @@ export function createElevenwardDatabase(connectionString = process.env.DATABASE
           [conflictId, accountId, slotIndex, choice]
         );
         const slot = await client.query(
-          `SELECT slot_index, snapshot, checksum, revision, client_updated_at, server_updated_at
+          `SELECT slot_index, career_id, position, difficulty, rules_version, seed,
+                  snapshot, checksum, revision, client_updated_at, server_updated_at
            FROM elevenward.career_slots WHERE account_id=$1 AND slot_index=$2`,
           [accountId, slotIndex]
         );
+        if (existing.rows[0] && existing.rows[0].career_id !== slot.rows[0]?.career_id) {
+          await replaceLeaderboardSubmission(client, accountId, existing.rows[0].career_id, null);
+        }
+        if (slot.rows[0]) {
+          const row = slot.rows[0];
+          const sync = {
+            careerId: row.career_id, position: row.position, difficulty: row.difficulty,
+            rulesVersion: row.rules_version, seed: Number(row.seed), checksum: row.checksum,
+            snapshot: row.snapshot
+          };
+          await replaceLeaderboardSubmission(
+            client, accountId, row.career_id,
+            publishLeaderboard ? leaderboardSubmissionFromSync(sync) : null
+          );
+        }
         await client.query("COMMIT");
         return slotResponse(slot.rows[0]);
       } catch (error) {
@@ -367,6 +547,7 @@ export function createElevenwardDatabase(connectionString = process.env.DATABASE
           "DELETE FROM elevenward.career_slots WHERE account_id=$1 AND slot_index=$2",
           [accountId, slotIndex]
         );
+        await replaceLeaderboardSubmission(client, accountId, current.career_id, null);
         await client.query("COMMIT");
         return { status: 204, body: null };
       } catch (error) {
@@ -377,33 +558,61 @@ export function createElevenwardDatabase(connectionString = process.env.DATABASE
       }
     },
 
-    async upsertLeaderboardSubmission(accountId, alias, submission, rejectionReason) {
-      const result = await requirePool().query(
-        `INSERT INTO elevenward.leaderboard_submissions
-           (account_id, career_id, alias, position, difficulty, rules_version, seasons, matches,
-            legacy_score, aggregate_metrics, validation_evidence, accepted, rejection_reason)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12,$13)
-         ON CONFLICT (account_id, career_id, difficulty, rules_version) DO UPDATE SET
-           alias=EXCLUDED.alias, position=EXCLUDED.position, seasons=EXCLUDED.seasons,
-           matches=EXCLUDED.matches, legacy_score=EXCLUDED.legacy_score,
-           aggregate_metrics=EXCLUDED.aggregate_metrics,
-           validation_evidence=EXCLUDED.validation_evidence, accepted=EXCLUDED.accepted,
-           rejection_reason=EXCLUDED.rejection_reason, updated_at=now()
-         RETURNING accepted, rejection_reason, updated_at`,
-        [accountId, submission.careerId, alias, submission.position, submission.difficulty,
-          submission.rulesVersion, submission.seasons, submission.matches, submission.legacyScore,
-          JSON.stringify(submission.aggregateMetrics), JSON.stringify(submission.validationEvidence),
-          !rejectionReason, rejectionReason]
-      );
-      return result.rows[0];
+    async upsertLeaderboardSubmission(accountId, submission) {
+      const client = await requirePool().connect();
+      try {
+        await client.query("BEGIN");
+        const owned = await client.query(
+          `SELECT career_id, position, difficulty, rules_version, seed, checksum, snapshot
+           FROM elevenward.career_slots WHERE account_id=$1 AND career_id=$2 FOR UPDATE`,
+          [accountId, submission.careerId]
+        );
+        if (!owned.rowCount) {
+          await client.query("ROLLBACK");
+          return { status: "missing" };
+        }
+        const row = owned.rows[0];
+        if (row.position !== submission.position || row.difficulty !== submission.difficulty ||
+            row.rules_version !== submission.rulesVersion) {
+          await client.query("ROLLBACK");
+          return { status: "stale" };
+        }
+        const projected = leaderboardSubmissionFromSync({
+          careerId: row.career_id, position: row.position, difficulty: row.difficulty,
+          rulesVersion: row.rules_version, seed: Number(row.seed), checksum: row.checksum,
+          snapshot: row.snapshot
+        });
+        if (!projected) {
+          await client.query("ROLLBACK");
+          return { status: "invalid" };
+        }
+        await replaceLeaderboardSubmission(client, accountId, row.career_id, projected);
+        await client.query("COMMIT");
+        return { status: "accepted" };
+      } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+      } finally {
+        client.release();
+      }
     },
 
     async getLeaderboard({ position, difficulty, rulesVersion, limit }) {
       const result = await requirePool().query(
-        `SELECT alias, career_id, legacy_score, aggregate_metrics, updated_at
-         FROM elevenward.leaderboard_submissions
-         WHERE position=$1 AND difficulty=$2 AND rules_version=$3 AND accepted=true
-         ORDER BY legacy_score DESC, updated_at ASC LIMIT $4`,
+        `SELECT CASE
+                  WHEN a.public_username IS NOT NULL AND a.username_suspended_at IS NULL
+                    THEN a.public_username
+                  ELSE s.position || ' Player ' || upper(substring(
+                    encode(digest(s.account_id::text || ':' || s.career_id, 'sha256'), 'hex')
+                    FROM 1 FOR 6))
+                END AS alias,
+                a.public_profile_id, a.id AS account_id, TRUE AS reportable,
+                s.career_id, s.position, s.legacy_score, s.aggregate_metrics, s.updated_at
+         FROM elevenward.leaderboard_submissions s
+         JOIN elevenward.accounts a ON a.id=s.account_id
+         JOIN elevenward.career_slots c ON c.account_id=s.account_id AND c.career_id=s.career_id
+         WHERE s.position=$1 AND s.difficulty=$2 AND s.rules_version=$3 AND s.accepted=true
+         ORDER BY s.legacy_score DESC, s.updated_at ASC LIMIT $4`,
         [position, difficulty, rulesVersion, limit]
       );
       return result.rows;

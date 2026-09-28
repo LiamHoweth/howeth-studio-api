@@ -8,6 +8,8 @@ import { prepareContentRelease } from "../src/elevenwardContent.js";
 import {
   canonicalJson,
   leaderboardRejection,
+  leaderboardSubmissionFromSync,
+  sha256,
   validateContentBundle,
   validateLeaderboardSubmission,
   validateSyncRequest
@@ -18,6 +20,7 @@ const account = {
   alias: "Swift Falcon 01234",
   provider: "apple",
   verified_email: "player@example.com",
+  public_profile_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
   expires_at: new Date("2027-12-01T00:00:00Z")
 };
 const elevenwardToken = "s".repeat(43);
@@ -50,7 +53,23 @@ function syncBody(baseRevision = 0) {
   };
 }
 
-const calls = { sync: [], leaderboard: [], events: [], webhook: [], deletion: [], staff: [] };
+function publishableSyncBody() {
+  const body = syncBody();
+  body.publishLeaderboard = true;
+  body.snapshot.revision = 12;
+  body.snapshot.season = 2;
+  body.snapshot.player = {
+    position: "striker", appearances: 10, goals: 5, assists: 3, reputation: 40,
+    attributes: {
+      pace: 60, technique: 60, passing: 60, finishing: 60,
+      defending: 60, strength: 60, stamina: 60, composure: 60
+    }
+  };
+  body.snapshot.seasonHistory = [{ averageRating: 7, trophies: ["league"] }];
+  return body;
+}
+
+const calls = { sync: [], leaderboard: [], usernames: [], reports: [], events: [], webhook: [], deletion: [], staff: [] };
 let analyticsGranted = false;
 let contentRow = null;
 
@@ -63,6 +82,19 @@ const elevenwardDatabase = {
     return { id: account.id, alias: account.alias, provider: input.identity.provider, email: input.identity.email };
   },
   async revokeSession() {},
+  async setPublicUsername(accountId, username, normalized) {
+    calls.usernames.push({ accountId, username, normalized });
+    if (username === "AlreadyTaken") return { status: "taken" };
+    if (username === "CooldownName") return { status: "cooldown", canChangeAt: "2027-01-01T00:00:00.000Z" };
+    if (username === "SuspendedName") return { status: "suspended" };
+    return { status: "updated", account: { public_username: username, username_updated_at: new Date() } };
+  },
+  async createUsernameReport(accountId, profileId, reason) {
+    calls.reports.push({ accountId, profileId, reason });
+    return { status: profileId === account.public_profile_id ? "self" : "created" };
+  },
+  async getUsernameReports() { return []; },
+  async resolveUsernameReport() { return { id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", status: "actioned" }; },
   async getAccountIdentities() { return []; },
   async deleteAccount() { calls.deletion.push("app"); },
   async createDeletionChallenge(_accountId, _codeHash, expiresAt) { return { expires_at: expiresAt }; },
@@ -94,13 +126,16 @@ const elevenwardDatabase = {
   },
   async listConflicts() { return []; },
   async resolveConflict() { return { slotIndex: 0, revision: 2 }; },
-  async upsertLeaderboardSubmission(_accountId, alias, submission, rejection) {
-    calls.leaderboard.push({ alias, submission, rejection });
-    return { accepted: !rejection };
+  async upsertLeaderboardSubmission(accountId, submission) {
+    calls.leaderboard.push({ accountId, submission });
+    return { status: "accepted" };
   },
   async getLeaderboard() {
     return [{
       alias: account.alias,
+      public_profile_id: account.public_profile_id,
+      account_id: account.id,
+      reportable: true,
       career_id: "33333333-3333-4333-8333-333333333333",
       legacy_score: 32000,
       aggregate_metrics: { goals: 40 },
@@ -245,6 +280,32 @@ describe("Elevenward isolated API", () => {
     assert.equal(conflict.remoteSnapshot.id, "remote");
   });
 
+  it("publishes active synced careers only with explicit consent and a server-derived score", async () => {
+    const oldBody = syncBody();
+    const legacy = validateSyncRequest(0, oldBody);
+    assert.equal(legacy.publishLeaderboard, false);
+    assert.equal(legacy.requestHash, sha256({ slotIndex: 0, baseRevision: 0, snapshot: oldBody.snapshot }));
+    const body = publishableSyncBody();
+    const sync = validateSyncRequest(0, body);
+    assert.equal(sync.publishLeaderboard, true);
+    assert.equal(leaderboardSubmissionFromSync(sync).legacyScore, 1489);
+    assert.equal(leaderboardSubmissionFromSync(sync).seasons, 2);
+    const accepted = await fetch(`${origin}/v1/elevenward/career-slots/0/sync`, {
+      method: "PUT", headers: auth, body: JSON.stringify(body)
+    });
+    assert.equal(accepted.status, 200);
+    assert.equal(calls.sync.at(-1).publishLeaderboard, true);
+    const privateSync = await fetch(`${origin}/v1/elevenward/career-slots/0/sync`, {
+      method: "PUT", headers: auth, body: JSON.stringify({ ...body, publishLeaderboard: false })
+    });
+    assert.equal(privateSync.status, 200);
+    assert.equal(calls.sync.at(-1).publishLeaderboard, false);
+    const invalid = await fetch(`${origin}/v1/elevenward/career-slots/0/sync`, {
+      method: "PUT", headers: auth, body: JSON.stringify({ ...syncBody(), publishLeaderboard: true })
+    });
+    assert.equal(invalid.status, 200);
+  });
+
   it("syncs offline deletions and conflicts instead of resurrecting a changed cloud career", async () => {
     const deleted = await fetch(`${origin}/v1/elevenward/career-slots/0?baseRevision=1`, {
       method: "DELETE", headers: auth
@@ -273,13 +334,75 @@ describe("Elevenward isolated API", () => {
       method: "POST", headers: auth, body: JSON.stringify(submission)
     });
     assert.equal(posted.status, 202);
-    assert.equal((await posted.json()).alias, account.alias);
+    assert.equal((await posted.json()).alias, `striker Player ${createHash("sha256")
+      .update(`${account.id}:33333333-3333-4333-8333-333333333333`).digest("hex").slice(0, 6).toUpperCase()}`);
 
-    const board = await fetch(`${origin}/v1/elevenward/leaderboards?position=striker&difficulty=balanced&rulesVersion=rules-1`);
+    const guestBoard = await fetch(`${origin}/v1/elevenward/leaderboards?position=striker&difficulty=balanced&rulesVersion=rules-1`);
+    assert.equal(guestBoard.status, 401);
+    const board = await fetch(`${origin}/v1/elevenward/leaderboards?position=striker&difficulty=balanced&rulesVersion=rules-1`, { headers: auth });
     assert.equal(board.status, 200);
     const body = await board.json();
     assert.match(body.notice, /no prizes/i);
     assert.equal(body.entries[0].alias, account.alias);
+    assert.equal(body.entries[0].profileId, account.public_profile_id);
+    assert.equal(body.entries[0].isCurrentUser, true);
+    assert.equal(body.entries[0].reportable, false);
+  });
+
+  it("offers the same account-wide username claim, cooldown, and moderation states", async () => {
+    const missing = await fetch(`${origin}/v1/elevenward/account/username`, {
+      method: "PUT", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ username: "PlayerOne" })
+    });
+    assert.equal(missing.status, 401);
+    const updated = await fetch(`${origin}/v1/elevenward/account/username`, {
+      method: "PUT", headers: auth, body: JSON.stringify({ username: "PlayerOne" })
+    });
+    assert.equal(updated.status, 200);
+    assert.equal((await updated.json()).account.publicUsername, "PlayerOne");
+    assert.deepEqual(calls.usernames.at(-1), {
+      accountId: account.id, username: "PlayerOne", normalized: "playerone"
+    });
+    for (const [username, expected] of [["AlreadyTaken", 409], ["CooldownName", 429], ["SuspendedName", 403], ["elevenward", 422], ["e1evenward", 422], ["ElevenwardOfficial", 422], ["f00tballera", 422]]) {
+      const response = await fetch(`${origin}/v1/elevenward/account/username`, {
+        method: "PUT", headers: auth, body: JSON.stringify({ username })
+      });
+      assert.equal(response.status, expected, username);
+    }
+  });
+
+  it("accepts account-only reports with Football Era reason identifiers", async () => {
+    const profileId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const guest = await fetch(`${origin}/v1/elevenward/leaderboard-reports`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ profileId, reason: "impersonation" })
+    });
+    assert.equal(guest.status, 401);
+    const reported = await fetch(`${origin}/v1/elevenward/leaderboard-reports`, {
+      method: "POST", headers: auth, body: JSON.stringify({ profileId, reason: "impersonation" })
+    });
+    assert.equal(reported.status, 202);
+    assert.deepEqual(calls.reports.at(-1), { accountId: account.id, profileId, reason: "impersonation" });
+    const self = await fetch(`${origin}/v1/elevenward/leaderboard-reports`, {
+      method: "POST", headers: auth,
+      body: JSON.stringify({ profileId: account.public_profile_id, reason: "other" })
+    });
+    assert.equal(self.status, 400);
+  });
+
+  it("keeps username moderation behind staff authorization", async () => {
+    const path = `${origin}/v1/elevenward/admin/username-reports`;
+    assert.equal((await fetch(path)).status, 401);
+    const authorized = await fetch(path, { headers: { authorization: "Bearer elevenward-admin" } });
+    assert.equal(authorized.status, 200);
+    assert.deepEqual((await authorized.json()).reports, []);
+    const action = await fetch(`${path}/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb`, {
+      method: "PATCH",
+      headers: { authorization: "Bearer elevenward-admin", "content-type": "application/json" },
+      body: JSON.stringify({ action: "suspend" })
+    });
+    assert.equal(action.status, 200);
+    assert.equal((await action.json()).status, "actioned");
   });
 
   it("accepts bounded boost evidence and legitimate boosted leaderboard ranges", () => {
