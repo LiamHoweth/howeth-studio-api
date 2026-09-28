@@ -63,6 +63,14 @@ async function replaceLeaderboardSubmission(client, accountId, careerId, submiss
   );
 }
 
+async function accountSharingEnabled(client, accountId) {
+  const result = await client.query(
+    "SELECT leaderboard_sharing_enabled FROM elevenward.accounts WHERE id=$1 FOR SHARE",
+    [accountId]
+  );
+  return result.rows[0]?.leaderboard_sharing_enabled === true;
+}
+
 export function createElevenwardDatabase(connectionString = process.env.DATABASE_URL) {
   const pool = connectionString ? new Pool({ connectionString }) : null;
   const requirePool = () => {
@@ -124,7 +132,8 @@ export function createElevenwardDatabase(connectionString = process.env.DATABASE
           [accountId, tokenHash, expiresAt]
         );
         const account = await client.query(
-          `SELECT alias, public_profile_id, public_username, username_updated_at, username_suspended_at
+          `SELECT alias, public_profile_id, public_username, username_updated_at,
+                  username_suspended_at, leaderboard_sharing_enabled
            FROM elevenward.accounts WHERE id = $1`, [accountId]
         );
         await client.query("COMMIT");
@@ -146,7 +155,7 @@ export function createElevenwardDatabase(connectionString = process.env.DATABASE
            RETURNING account_id, expires_at
          )
          SELECT a.id, a.alias, a.public_profile_id, a.public_username,
-                a.username_updated_at, a.username_suspended_at,
+                a.username_updated_at, a.username_suspended_at, a.leaderboard_sharing_enabled,
                 i.provider, i.verified_email, active.expires_at
          FROM active JOIN elevenward.accounts a ON a.id = active.account_id
          JOIN elevenward.auth_identities i ON i.account_id = a.id
@@ -161,6 +170,43 @@ export function createElevenwardDatabase(connectionString = process.env.DATABASE
         "UPDATE elevenward.sessions SET revoked_at = now() WHERE token_hash = $1 AND revoked_at IS NULL",
         [tokenHash]
       );
+    },
+
+    async setLeaderboardSharing(accountId, enabled) {
+      const client = await requirePool().connect();
+      try {
+        await client.query("BEGIN");
+        const updated = await client.query(
+          `UPDATE elevenward.accounts SET leaderboard_sharing_enabled=$2, updated_at=now()
+           WHERE id=$1 RETURNING leaderboard_sharing_enabled`, [accountId, enabled]
+        );
+        if (!updated.rowCount) {
+          await client.query("ROLLBACK");
+          return null;
+        }
+        await client.query("DELETE FROM elevenward.leaderboard_submissions WHERE account_id=$1", [accountId]);
+        if (enabled) {
+          const slots = await client.query(
+            `SELECT career_id, position, difficulty, rules_version, seed, checksum, snapshot
+             FROM elevenward.career_slots WHERE account_id=$1 ORDER BY slot_index`, [accountId]
+          );
+          for (const row of slots.rows) {
+            const projected = leaderboardSubmissionFromSync({
+              careerId: row.career_id, position: row.position, difficulty: row.difficulty,
+              rulesVersion: row.rules_version, seed: Number(row.seed), checksum: row.checksum,
+              snapshot: row.snapshot
+            });
+            if (projected) await replaceLeaderboardSubmission(client, accountId, row.career_id, projected);
+          }
+        }
+        await client.query("COMMIT");
+        return updated.rows[0];
+      } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+      } finally {
+        client.release();
+      }
     },
 
     async setPublicUsername(accountId, username, normalized) {
@@ -315,6 +361,7 @@ export function createElevenwardDatabase(connectionString = process.env.DATABASE
       const client = await requirePool().connect();
       try {
         await client.query("BEGIN");
+        const sharingEnabled = await accountSharingEnabled(client, accountId);
         const replay = await client.query(
           `SELECT request_hash, response_status, response_body FROM elevenward.idempotency_keys
            WHERE account_id = $1 AND idempotency_key = $2 AND expires_at > now()`,
@@ -397,7 +444,8 @@ export function createElevenwardDatabase(connectionString = process.env.DATABASE
             request.contentVersion, request.position, request.difficulty, request.seed, request.checksum,
             JSON.stringify(request.snapshot), revision, request.updatedAt]
         );
-        const projected = request.publishLeaderboard ? leaderboardSubmissionFromSync(request) : null;
+        const projected = request.publishLeaderboard && sharingEnabled
+          ? leaderboardSubmissionFromSync(request) : null;
         const body = { slot: slotResponse(saved.rows[0]), leaderboardPublished: Boolean(projected) };
         if (current && current.career_id !== request.careerId) {
           await replaceLeaderboardSubmission(client, accountId, current.career_id, null);
@@ -434,6 +482,7 @@ export function createElevenwardDatabase(connectionString = process.env.DATABASE
       const client = await requirePool().connect();
       try {
         await client.query("BEGIN");
+        const sharingEnabled = await accountSharingEnabled(client, accountId);
         const result = await client.query(
           `SELECT * FROM elevenward.sync_conflicts
            WHERE id = $1 AND account_id = $2 AND slot_index = $3 AND status = 'pending' FOR UPDATE`,
@@ -498,7 +547,7 @@ export function createElevenwardDatabase(connectionString = process.env.DATABASE
           };
           await replaceLeaderboardSubmission(
             client, accountId, row.career_id,
-            publishLeaderboard ? leaderboardSubmissionFromSync(sync) : null
+            publishLeaderboard && sharingEnabled ? leaderboardSubmissionFromSync(sync) : null
           );
         }
         await client.query("COMMIT");
@@ -562,6 +611,10 @@ export function createElevenwardDatabase(connectionString = process.env.DATABASE
       const client = await requirePool().connect();
       try {
         await client.query("BEGIN");
+        if (!await accountSharingEnabled(client, accountId)) {
+          await client.query("ROLLBACK");
+          return { status: "disabled" };
+        }
         const owned = await client.query(
           `SELECT career_id, position, difficulty, rules_version, seed, checksum, snapshot
            FROM elevenward.career_slots WHERE account_id=$1 AND career_id=$2 FOR UPDATE`,
@@ -612,6 +665,7 @@ export function createElevenwardDatabase(connectionString = process.env.DATABASE
          JOIN elevenward.accounts a ON a.id=s.account_id
          JOIN elevenward.career_slots c ON c.account_id=s.account_id AND c.career_id=s.career_id
          WHERE s.position=$1 AND s.difficulty=$2 AND s.rules_version=$3 AND s.accepted=true
+           AND a.leaderboard_sharing_enabled=true
          ORDER BY s.legacy_score DESC, s.updated_at ASC LIMIT $4`,
         [position, difficulty, rulesVersion, limit]
       );

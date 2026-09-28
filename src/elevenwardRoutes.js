@@ -92,6 +92,7 @@ function publicAccount(account) {
     email: account.email ?? account.verified_email ?? null,
     publicUsername,
     usernameStatus: suspended ? "suspended" : publicUsername ? "active" : "unset",
+    leaderboardSharingEnabled: account.leaderboard_sharing_enabled === true,
     usernameCanChangeAt: publicUsername && account.username_updated_at
       ? new Date(new Date(account.username_updated_at).getTime() + 30 * 86_400_000).toISOString()
       : null
@@ -206,6 +207,19 @@ export function createElevenwardRouter({
         account: publicAccount({ ...req.elevenwardAccount, ...result.account }),
         expiresAt: new Date(req.elevenwardAccount.expires_at).toISOString()
       });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  router.put("/account/leaderboard-sharing", requireAccount, async (req, res, next) => {
+    try {
+      if (typeof req.body?.enabled !== "boolean") {
+        return res.status(400).json({ error: "enabled must be a boolean" });
+      }
+      const result = await database.setLeaderboardSharing(req.elevenwardAccount.id, req.body.enabled);
+      if (!result) return res.status(404).json({ error: "account_not_found" });
+      return res.json({ account: publicAccount({ ...req.elevenwardAccount, ...result }) });
     } catch (error) {
       return next(error);
     }
@@ -410,6 +424,7 @@ export function createElevenwardRouter({
       const rejection = leaderboardRejection(submission);
       if (rejection) return res.status(422).json({ error: "Submission rejected", reason: rejection });
       const result = await database.upsertLeaderboardSubmission(req.elevenwardAccount.id, submission);
+      if (result.status === "disabled") return res.status(403).json({ error: "leaderboard_sharing_disabled" });
       if (result.status === "missing") return res.status(404).json({ error: "career_not_synced" });
       if (result.status === "stale") return res.status(409).json({ error: "career_snapshot_changed" });
       if (result.status === "invalid") return res.status(422).json({ error: "Career is not eligible for the leaderboard" });

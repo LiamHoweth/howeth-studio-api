@@ -21,6 +21,7 @@ const account = {
   provider: "apple",
   verified_email: "player@example.com",
   public_profile_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+  leaderboard_sharing_enabled: true,
   expires_at: new Date("2027-12-01T00:00:00Z")
 };
 const elevenwardToken = "s".repeat(43);
@@ -69,7 +70,7 @@ function publishableSyncBody() {
   return body;
 }
 
-const calls = { sync: [], leaderboard: [], usernames: [], reports: [], events: [], webhook: [], deletion: [], staff: [] };
+const calls = { sync: [], leaderboard: [], usernames: [], reports: [], sharing: [], events: [], webhook: [], deletion: [], staff: [] };
 let analyticsGranted = false;
 let contentRow = null;
 
@@ -82,6 +83,10 @@ const elevenwardDatabase = {
     return { id: account.id, alias: account.alias, provider: input.identity.provider, email: input.identity.email };
   },
   async revokeSession() {},
+  async setLeaderboardSharing(accountId, enabled) {
+    calls.sharing.push({ accountId, enabled });
+    return { leaderboard_sharing_enabled: enabled };
+  },
   async setPublicUsername(accountId, username, normalized) {
     calls.usernames.push({ accountId, username, normalized });
     if (username === "AlreadyTaken") return { status: "taken" };
@@ -262,6 +267,24 @@ describe("Elevenward isolated API", () => {
     const body = await response.json();
     assert.equal(body.account.alias, account.alias);
     assert.ok(body.accessToken.length >= 40);
+  });
+
+  it("stores a sharing choice on the account and validates its shape", async () => {
+    const response = await fetch(`${origin}/v1/elevenward/account/leaderboard-sharing`, {
+      method: "PUT", headers: auth, body: JSON.stringify({ enabled: false })
+    });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).account.leaderboardSharingEnabled, false);
+    assert.deepEqual(calls.sharing.at(-1), { accountId: account.id, enabled: false });
+    const invalid = await fetch(`${origin}/v1/elevenward/account/leaderboard-sharing`, {
+      method: "PUT", headers: auth, body: JSON.stringify({ enabled: "false" })
+    });
+    assert.equal(invalid.status, 400);
+    const guest = await fetch(`${origin}/v1/elevenward/account/leaderboard-sharing`, {
+      method: "PUT", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ enabled: true })
+    });
+    assert.equal(guest.status, 401);
   });
 
   it("accepts a versioned SyncRequest and surfaces a 409 preserving both snapshots", async () => {
