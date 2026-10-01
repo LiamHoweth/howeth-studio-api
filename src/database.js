@@ -210,25 +210,22 @@ export function createDatabase(connectionString = process.env.DATABASE_URL) {
       return result.rows[0] ?? null;
     },
 
-    async getFeedback({ status = null, limit = 50 } = {}) {
-      const params = status ? [status, limit] : [limit];
-      const where = status ? "WHERE status = $1" : "";
-      const limitParam = status ? "$2" : "$1";
+    async getFeedback({ status = null, product = null, limit = 50 } = {}) {
       const result = await pool.query(
         `SELECT id, category, message, contact_email, source, platform, app_version,
-                status, created_at, updated_at
-         FROM feedback_submissions ${where}
-         ORDER BY created_at DESC LIMIT ${limitParam}`,
-        params
+                product, support_code, diagnostics, status, created_at, updated_at
+         FROM feedback_submissions WHERE ($1::text IS NULL OR status=$1)
+           AND ($2::text IS NULL OR product=$2)
+         ORDER BY created_at DESC LIMIT $3`, [status, product, limit]
       );
       return result.rows;
     },
 
-    async getFeedbackSummary() {
+    async getFeedbackSummary({ product = null } = {}) {
       const result = await pool.query(
         `SELECT count(*)::int AS total,
                 count(*) FILTER (WHERE status = 'new')::int AS unread
-         FROM feedback_submissions`
+         FROM feedback_submissions WHERE ($1::text IS NULL OR product=$1)`, [product]
       );
       return result.rows[0];
     },

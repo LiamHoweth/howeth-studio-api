@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { validateCareerFeatures, modernRoleContribution } from "./elevenwardDurableValidation.js";
 
 export const ELEVENWARD_POSITIONS = new Set(["striker", "winger", "midfielder", "defender"]);
 export const ELEVENWARD_DIFFICULTIES = new Set(["story", "balanced", "elite"]);
@@ -103,6 +104,7 @@ export function validateSyncRequest(slotParam, body) {
   if (slotIndex == null || baseRevision == null || !idempotencyKey || !careerId || schemaVersion == null ||
       !rulesVersion || !contentVersion || !ELEVENWARD_POSITIONS.has(position) ||
       !ELEVENWARD_DIFFICULTIES.has(difficulty) || seed == null || revision == null || !updatedAt) return null;
+  if (!validateCareerFeatures(snapshot)) return null;
   const encoded = canonicalJson(snapshot);
   if (Buffer.byteLength(encoded, "utf8") > 5_000_000) return null;
   return {
@@ -117,9 +119,16 @@ export function validateSyncRequest(slotParam, body) {
 }
 
 export function validateConflictResolution(body) {
-  return object(body) && ["local", "remote"].includes(body.choice) &&
-    (body.publishLeaderboard == null || typeof body.publishLeaderboard === "boolean")
-    ? { choice: body.choice, publishLeaderboard: body.publishLeaderboard === true } : null;
+  if (!object(body) || !["local", "remote"].includes(body.choice) ||
+      (body.publishLeaderboard != null && typeof body.publishLeaderboard !== "boolean")) return null;
+  const hasLocalSnapshot = Object.hasOwn(body, "localSnapshot");
+  if (hasLocalSnapshot && (body.choice !== "local" || !object(body.localSnapshot))) return null;
+  const expectedRemoteRevision = body.expectedRemoteRevision == null ? null
+    : int(body.expectedRemoteRevision, 0, Number.MAX_SAFE_INTEGER);
+  if ((body.expectedRemoteRevision != null && expectedRemoteRevision == null) ||
+      (hasLocalSnapshot && expectedRemoteRevision == null)) return null;
+  return { choice: body.choice, publishLeaderboard: body.publishLeaderboard === true,
+    ...(hasLocalSnapshot ? { localSnapshot: body.localSnapshot } : {}), expectedRemoteRevision };
 }
 
 const OVERALL_WEIGHTS = {
@@ -160,9 +169,13 @@ export function leaderboardSubmissionFromSync(sync) {
   const currentSeason = snapshot.season == null ? history.length + 1 : int(snapshot.season, 1, 21);
   if (currentSeason == null) return null;
   const seasons = Math.min(20, Math.max(1, history.length, currentSeason));
+  if (!validateCareerFeatures(snapshot)) return null;
+  const modern = sync.rulesVersion === "2026.5";
+  const weights = modern ? { striker: [12, 8], winger: [8, 12], midfielder: [5, 12], defender: [5, 6] }[sync.position] : [12, 8];
   const legacyScore = Math.round(
-    appearances * 4 + goals * 12 + assists * 8 + trophies * 180 +
-    reputation * 9 + Math.round(weightedOverall) * 5 + averageRating * 75
+    appearances * 4 + goals * weights[0] + assists * weights[1] + trophies * 180 +
+    reputation * 9 + Math.round(weightedOverall) * 5 + averageRating * 75 +
+    (modern ? modernRoleContribution(sync.position, snapshot.roleStats) : 0)
   );
   const submission = validateLeaderboardSubmission({
     careerId: sync.careerId,
@@ -178,7 +191,9 @@ export function leaderboardSubmissionFromSync(sync) {
       developmentProgress: snapshot.developmentProgress ?? {}
     }
   });
-  return submission && !leaderboardRejection(submission) ? submission : null;
+  return submission && !leaderboardRejection(submission)
+    ? { ...submission, aggregateMetrics: { ...submission.aggregateMetrics, ...(modern ? snapshot.roleStats ?? {} : {}) } }
+    : null;
 }
 
 export function validateLeaderboardSubmission(body) {
@@ -342,9 +357,10 @@ export function validateContentBundle(body) {
   const releaseVersion = cleanText(body.metadata.releaseVersion, 1, 64);
   const minClientVersion = cleanText(body.metadata.minClientVersion, 1, 32);
   const maxClientVersion = body.metadata.maxClientVersion == null ? null : cleanText(body.metadata.maxClientVersion, 1, 32);
+  const expanded = ["2026.4", "2026.5"].includes(body.metadata.rulesVersion);
   const collections = [
-    ["clubs", 120], ["nationalTeams", 24], ["matchSituations", 160],
-    ["events", 200], ["lifestyleItems", 120]
+    ["clubs", expanded ? 520 : 120], ["nationalTeams", expanded ? 48 : 24], ["matchSituations", 160],
+    ["events", body.metadata.rulesVersion === "2026.5" ? 104 : body.metadata.rulesVersion === "2026.4" ? 100 : 200], ["lifestyleItems", 120]
   ];
   const errors = [];
   const releaseSemver = semver(releaseVersion);
@@ -355,8 +371,11 @@ export function validateContentBundle(body) {
   } else if (maximumSemver && compareVersion(minimumSemver, maximumSemver) > 0) {
     errors.push("Minimum client version cannot exceed maximum client version.");
   }
-  if (!["2026.2", "2026.3"].includes(body.metadata.rulesVersion)) {
-    errors.push("Content may only target the executable 2026.2 or 2026.3 rules version.");
+  if (body.metadata.rulesVersion === "2026.5" && minimumSemver && compareVersion(minimumSemver, [1, 1, 0]) < 0) {
+    errors.push("2026.5 content requires client version 1.1.0 or later.");
+  }
+  if (!["2026.2", "2026.3", "2026.4", "2026.5"].includes(body.metadata.rulesVersion)) {
+    errors.push("Content must target an executable 2026.2 through 2026.5 rules version.");
   }
   const ids = new Set();
   for (const [key, exact] of collections) {
@@ -440,7 +459,7 @@ export function validateContentBundle(body) {
   }
 
   const leagues = Array.isArray(body.leagues) ? body.leagues : [];
-  if (leagues.length !== 12) errors.push("Exactly 12 league divisions are required.");
+  if (leagues.length !== (expanded ? 52 : 12)) errors.push("League division count does not match the executable rules.");
   const leagueIds = new Set();
   const assignedClubs = new Set();
   for (const league of leagues) {
@@ -456,10 +475,10 @@ export function validateContentBundle(body) {
       assignedClubs.add(clubId);
     }
   }
-  if (assignedClubs.size !== 120) errors.push("Every launch club must be assigned to exactly one league.");
+  if (assignedClubs.size !== (expanded ? 520 : 120)) errors.push("Every launch club must be assigned to exactly one league.");
 
   const fixtures = Array.isArray(body.fixtures) ? body.fixtures : [];
-  if (fixtures.length !== 1080) errors.push("The launch world requires 1,080 league fixtures.");
+  if (fixtures.length !== (expanded ? 4680 : 1080)) errors.push("League fixture count does not match the executable rules.");
   const fixtureIds = new Set();
   const fixturesByLeague = new Map([...leagueIds].map((id) => [id, []]));
   for (const fixture of fixtures) {
@@ -495,7 +514,7 @@ export function validateContentBundle(body) {
   }
 
   const cups = Array.isArray(body.domesticCups) ? body.domesticCups : [];
-  if (cups.length !== 6) errors.push("Exactly six domestic cups are required.");
+  if (cups.length !== (expanded ? 26 : 6)) errors.push("Domestic cup count does not match the executable rules.");
   const competitionIds = new Set(leagueIds);
   const validateCompetitionFixture = (fixture, competitionId, participants) => {
     if (!cleanText(fixture?.id, 1, 140) || fixtureIds.has(fixture.id)) {
@@ -528,14 +547,14 @@ export function validateContentBundle(body) {
   const international = body.internationalClubCompetition;
   const internationalId = cleanText(international?.id, 1, 100);
   const internationalParticipants = new Set(Array.isArray(international?.participantIds) ? international.participantIds : []);
-  if (!object(international) || !internationalId || competitionIds.has(internationalId) || !Array.isArray(international.participantIds) || international.participantIds.length !== 12 ||
-      internationalParticipants.size !== 12 || international.participantIds.some((id) => !clubIds.has(id))) {
-    errors.push("The international club competition must reference twelve unique clubs.");
+  if (!object(international) || !internationalId || competitionIds.has(internationalId) || !Array.isArray(international.participantIds) || international.participantIds.length !== (expanded ? 32 : 12) ||
+      internationalParticipants.size !== (expanded ? 32 : 12) || international.participantIds.some((id) => !clubIds.has(id))) {
+    errors.push("The international club participant count must match the executable rules.");
   } else {
     competitionIds.add(internationalId);
   }
-  if (!Array.isArray(international?.fixtures) || international.fixtures.length !== 18) {
-    errors.push("The international club competition must contain eighteen group fixtures.");
+  if (!Array.isArray(international?.fixtures) || international.fixtures.length !== (expanded ? 48 : 18)) {
+    errors.push("The international club fixture count must match the executable rules.");
   } else {
     const appearances = new Map([...internationalParticipants].map((id) => [id, 0]));
     for (const fixture of international.fixtures) {
@@ -547,7 +566,7 @@ export function validateContentBundle(body) {
       errors.push("Every international club must have exactly three group fixtures.");
     }
   }
-  if (nationalIds.size !== 24) errors.push("National team identifiers must be unique.");
+  if (nationalIds.size !== (expanded ? 48 : 24)) errors.push("National team identifiers must be unique.");
   if (errors.length > 100) errors.splice(100, errors.length - 100, "Additional validation errors omitted.");
   return {
     valid: errors.length === 0,

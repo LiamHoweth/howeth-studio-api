@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import pg from "pg";
-import { leaderboardSubmissionFromSync } from "./elevenwardValidation.js";
+import { createElevenwardFeaturesDatabase } from "./elevenwardFeaturesDatabase.js";
+import { leaderboardSubmissionFromSync, sha256 } from "./elevenwardValidation.js";
 
 const { Pool } = pg;
 
@@ -63,9 +64,10 @@ async function replaceLeaderboardSubmission(client, accountId, careerId, submiss
   );
 }
 
+// One account lock serializes sync/resolve/delete before conflict and slot locks.
 async function accountSharingEnabled(client, accountId) {
   const result = await client.query(
-    "SELECT leaderboard_sharing_enabled FROM elevenward.accounts WHERE id=$1 FOR SHARE",
+    "SELECT leaderboard_sharing_enabled FROM elevenward.accounts WHERE id=$1 FOR UPDATE",
     [accountId]
   );
   return result.rows[0]?.leaderboard_sharing_enabled === true;
@@ -80,6 +82,7 @@ export function createElevenwardDatabase(connectionString = process.env.DATABASE
 
   return {
     configured: Boolean(pool),
+    ...createElevenwardFeaturesDatabase(requirePool),
 
     async ping() {
       if (!pool) return false;
@@ -478,7 +481,7 @@ export function createElevenwardDatabase(connectionString = process.env.DATABASE
       return result.rows.map(conflictResponse);
     },
 
-    async resolveConflict(accountId, slotIndex, conflictId, choice, publishLeaderboard, metadataForSnapshot) {
+    async resolveConflict(accountId, slotIndex, conflictId, choice, publishLeaderboard, metadataForSnapshot, latestLocalSnapshot, expectedRemoteRevision = null) {
       const client = await requirePool().connect();
       try {
         await client.query("BEGIN");
@@ -494,17 +497,44 @@ export function createElevenwardDatabase(connectionString = process.env.DATABASE
         }
         const conflict = result.rows[0];
         const existing = await client.query(
-          "SELECT career_id FROM elevenward.career_slots WHERE account_id=$1 AND slot_index=$2 FOR UPDATE",
+          "SELECT career_id, revision, checksum FROM elevenward.career_slots WHERE account_id=$1 AND slot_index=$2 FOR UPDATE",
           [accountId, slotIndex]
         );
+        const currentRevision = Number(existing.rows[0]?.revision ?? 0);
+        const unchangedRemote = existing.rows[0]
+          ? conflict.remote_snapshot != null && existing.rows[0].checksum === sha256(conflict.remote_snapshot)
+          : conflict.remote_snapshot == null;
+        if (!unchangedRemote || currentRevision !== Number(conflict.remote_revision) ||
+            (expectedRemoteRevision != null && expectedRemoteRevision !== currentRevision)) {
+          const error = new Error("Cloud career changed since this conflict was shown");
+          error.code = "CONFLICT_REMOTE_CHANGED";
+          throw error;
+        }
+        let selectedLocal = conflict.local_snapshot;
+        if (latestLocalSnapshot !== undefined) {
+          const original = metadataForSnapshot(conflict.local_snapshot);
+          const latest = metadataForSnapshot(latestLocalSnapshot);
+          if (choice !== "local" || !original || !latest || expectedRemoteRevision == null ||
+              ["careerId", "rulesVersion", "contentVersion", "position", "difficulty"].some(key => original[key] !== latest[key]) ||
+              latest.schemaVersion < original.schemaVersion ||
+              latest.snapshot.revision < original.snapshot.revision ||
+              Number(latest.snapshot.season ?? 0) < Number(original.snapshot.season ?? 0) ||
+              ["appearances", "goals", "assists"].some(key => Number(latest.snapshot.player?.[key] ?? 0) < Number(original.snapshot.player?.[key] ?? 0)) ||
+              (latest.snapshot.seasonHistory?.length ?? 0) < (original.snapshot.seasonHistory?.length ?? 0)) {
+            const error = new Error("Latest local career does not descend from the conflict career");
+            error.code = "CONFLICT_LOCAL_MISMATCH";
+            throw error;
+          }
+          selectedLocal = latestLocalSnapshot;
+        }
         if (choice === "local") {
-          if (conflict.local_snapshot == null) {
+          if (selectedLocal == null) {
             await client.query(
               "DELETE FROM elevenward.career_slots WHERE account_id=$1 AND slot_index=$2",
               [accountId, slotIndex]
             );
           } else {
-            const local = metadataForSnapshot(conflict.local_snapshot);
+            const local = metadataForSnapshot(selectedLocal);
             if (!local) throw new Error("Conflict contains an invalid local snapshot");
             await client.query(
             `INSERT INTO elevenward.career_slots
@@ -564,6 +594,16 @@ export function createElevenwardDatabase(connectionString = process.env.DATABASE
       const client = await requirePool().connect();
       try {
         await client.query("BEGIN");
+        // Serialize career mutations per account before locking conflicts/slots.
+        await client.query("SELECT id FROM elevenward.accounts WHERE id=$1 FOR UPDATE", [accountId]);
+        const pending = await client.query(
+          "SELECT * FROM elevenward.sync_conflicts WHERE account_id=$1 AND slot_index=$2 AND status='pending' FOR UPDATE",
+          [accountId, slotIndex]
+        );
+        if (pending.rowCount) {
+          await client.query("COMMIT");
+          return { status: 409, body: { conflict: conflictResponse(pending.rows[0]) } };
+        }
         const currentResult = await client.query(
           `SELECT * FROM elevenward.career_slots
            WHERE account_id=$1 AND slot_index=$2 FOR UPDATE`,
@@ -666,7 +706,7 @@ export function createElevenwardDatabase(connectionString = process.env.DATABASE
          JOIN elevenward.career_slots c ON c.account_id=s.account_id AND c.career_id=s.career_id
          WHERE s.position=$1 AND s.difficulty=$2 AND s.rules_version=$3 AND s.accepted=true
            AND a.leaderboard_sharing_enabled=true
-         ORDER BY s.legacy_score DESC, s.updated_at ASC LIMIT $4`,
+         ORDER BY s.legacy_score DESC, s.updated_at ASC, s.id ASC LIMIT $4`,
         [position, difficulty, rulesVersion, limit]
       );
       return result.rows;

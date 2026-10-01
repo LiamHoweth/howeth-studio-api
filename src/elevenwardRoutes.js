@@ -1,5 +1,7 @@
 import { createHash, randomBytes, randomInt, timingSafeEqual } from "node:crypto";
 import express from "express";
+import { installElevenwardFeatureRoutes } from "./elevenwardFeaturesRoutes.js";
+import { uuidPattern } from "./elevenwardFeaturesValidation.js";
 import { createContentSigner, createContentStore, prepareContentRelease } from "./elevenwardContent.js";
 import {
   canonicalJson,
@@ -104,7 +106,8 @@ export function createElevenwardRouter({
   env = process.env,
   providerAuth,
   contentStore = createContentStore(env),
-  contentSigner = createContentSigner(env)
+  contentSigner = createContentSigner(env),
+  replayChallenge
 }) {
   const router = express.Router();
 
@@ -151,6 +154,8 @@ export function createElevenwardRouter({
       metadata
     });
   }
+
+  installElevenwardFeatureRoutes(router, { database, requireAccount, requireStaff, ...(replayChallenge ? { replayChallenge } : {}) });
 
   async function signIn(provider, req, res, next) {
     try {
@@ -348,6 +353,10 @@ export function createElevenwardRouter({
           !/^[0-9a-f-]{36}$/i.test(req.params.conflictId) || !resolution) {
         return res.status(400).json({ error: "Invalid conflict resolution" });
       }
+      if (resolution.localSnapshot && !validateSyncRequest(slotIndex, {
+        baseRevision: 0, idempotencyKey: "00000000-0000-4000-8000-000000000000",
+        snapshot: resolution.localSnapshot, publishLeaderboard: resolution.publishLeaderboard
+      })) return res.status(422).json({ error: "Invalid latest local snapshot" });
       const slot = await database.resolveConflict(
         req.elevenwardAccount.id,
         slotIndex,
@@ -359,12 +368,16 @@ export function createElevenwardRouter({
           idempotencyKey: "00000000-0000-4000-8000-000000000000",
           snapshot,
           publishLeaderboard: resolution.publishLeaderboard
-        })
+        }),
+        resolution.localSnapshot,
+        resolution.expectedRemoteRevision
       );
       return slot === undefined
         ? res.status(404).json({ error: "Pending conflict not found" })
         : res.json({ slot, resolution: resolution.choice });
     } catch (error) {
+      if (error?.code === "CONFLICT_REMOTE_CHANGED") return res.status(409).json({ error: "conflict_remote_changed" });
+      if (error?.code === "CONFLICT_LOCAL_MISMATCH") return res.status(422).json({ error: "conflict_local_snapshot_mismatch" });
       return next(error);
     }
   });
@@ -441,20 +454,24 @@ export function createElevenwardRouter({
     try {
       const query = validateLeaderboardQuery(req.query);
       if (!query) return res.status(400).json({ error: "position, difficulty, and rulesVersion are required" });
-      const rows = await database.getLeaderboard(query);
+      if (req.query.careerId != null && !uuidPattern.test(req.query.careerId)) return res.status(400).json({ error: "Invalid careerId" });
+      const context = database.getLeaderboardContext
+        ? await database.getLeaderboardContext(req.elevenwardAccount.id, query, req.query.careerId ?? null)
+        : null;
+      const rows = context?.entries ?? await database.getLeaderboard(query);
+      const mapEntry = (row, index = 0) => ({
+        rank: Number(row.rank ?? index + 1), alias: row.alias,
+        profileId: row.public_profile_id, isCurrentUser: row.account_id === req.elevenwardAccount.id,
+        reportable: Boolean(row.reportable) && row.account_id !== req.elevenwardAccount.id,
+        careerId: row.career_id, legacyScore: Number(row.legacy_score), aggregateMetrics: row.aggregate_metrics,
+        updatedAt: new Date(row.updated_at).toISOString()
+      });
       return res.json({
+        totalEntries: context?.totalEntries ?? rows.length,
+        myEntry: context?.myEntry ? mapEntry(context.myEntry) : null,
+        nearbyEntries: context?.nearbyEntries?.map(mapEntry) ?? [],
         board: { position: query.position, difficulty: query.difficulty, rulesVersion: query.rulesVersion },
-        entries: rows.map((row, index) => ({
-          rank: index + 1,
-          alias: row.alias,
-          profileId: row.public_profile_id,
-          isCurrentUser: row.account_id === req.elevenwardAccount.id,
-          reportable: Boolean(row.reportable) && row.account_id !== req.elevenwardAccount.id,
-          careerId: row.career_id,
-          legacyScore: Number(row.legacy_score),
-          aggregateMetrics: row.aggregate_metrics,
-          updatedAt: new Date(row.updated_at).toISOString()
-        })),
+        entries: rows.map(mapEntry),
         notice: "Offline careers cannot be perfectly cheat-proof; this board awards no prizes."
       });
     } catch (error) {
