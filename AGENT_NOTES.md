@@ -1,0 +1,9 @@
+# Agent notes
+
+- Elevenward career/social APIs live in `elevenwardFeaturesRoutes.js` and `elevenwardFeaturesDatabase.js`; the shared feedback inbox is filtered by `product`. Archives and private friend comparisons never implicitly publish to leaderboards. Comparison consent is bilateral and independent of public sharing.
+- Migration 010 adds archives, friendships, blocks, hashed expiring invites and weekly attempts with account-deletion cascades. Archives survive playable-slot deletion. Preserve the append-only migration sequence.
+- Weekly challenge verification executes the vendored pure Dart helper, pinned to rules `2026.5` and content `2026.4.0`. Docker builds its executable; `ELEVENWARD_REPLAY_EXECUTABLE` controls the fixed executable path. Never replace deterministic replay with accepting a client score. The source manifest verifies vendored files; restage source and manifest together when intentionally changing executable rules.
+- Schema 14 durable features are bounded by `elevenwardDurableValidation.js`; server legacy scoring matches the role-specific core formula and retains earlier rules scoring. Signed content validation preserves older 120-club/24-team worlds and expanded 520-club/48-team worlds; 2026.5 includes 104 story events.
+- `verifyElevenwardFeatures.js` and `verifyWeeklyChallenge.js` require an explicit disposable localhost PostgreSQL URL. The latter also requires the actual compiled Dart helper. A local native replay check does not establish a successful Linux Docker build or Railway deployment.
+
+- Conflict resolution accepts a current local snapshot plus expected remote revision, preserves evolving RNG seeds, and checks the stored remote checksum. Career writes serialize account then conflict then slot; deletion returns pending conflicts intact. Client generation guards are still required for changes made while a resolution request is in flight. Linux Docker plus actual replay/SQL regressions run in CI.

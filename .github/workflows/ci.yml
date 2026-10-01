@@ -20,3 +20,41 @@ jobs:
       - run: npm ci
       - run: npm test
       - run: npm audit --audit-level=high
+
+  linux-runtime:
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: elevenward_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d elevenward_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      # Dummy credentials belong only to the disposable loopback CI service.
+      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/elevenward_ci
+      TASK_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/elevenward_ci
+      ELEVENWARD_REPLAY_EXECUTABLE: /app/bin/challenge-replay
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build production Linux API and pinned Dart replay
+        run: docker build --tag elevenward-api-ci .
+      - name: Verify source manifest and migrate disposable PostgreSQL
+        run: |
+          docker run --rm --network host elevenward-api-ci node scripts/verifyReplaySource.js
+          docker run --rm --network host -e DATABASE_URL elevenward-api-ci node scripts/migrate.js
+      - name: Verify SQL privacy, archives, friends and attempt consistency
+        run: docker run --rm --network host -e TASK_TEST_DATABASE_URL elevenward-api-ci node scripts/verifyElevenwardFeatures.js
+      - name: Verify actual Linux Dart engine with authenticated HTTP and SQL
+        run: docker run --rm --network host -e TASK_TEST_DATABASE_URL -e ELEVENWARD_REPLAY_EXECUTABLE elevenward-api-ci node scripts/verifyWeeklyChallenge.js
+      - name: Verify continued local progress and conflict races with actual engine
+        run: docker run --rm --network host -e TASK_TEST_DATABASE_URL -e ELEVENWARD_REPLAY_EXECUTABLE elevenward-api-ci node scripts/verifyLatestConflict.js
