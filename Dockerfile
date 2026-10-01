@@ -13,8 +13,10 @@ COPY scripts/ ./scripts/
 COPY migrations/ ./migrations/
 COPY vendor/elevenward_core/ ./vendor/elevenward_core/
 RUN node scripts/verifyReplaySource.js
-COPY --from=replay-build /runtime/ /
+# The Node Debian image already supplies glibc. Copying Dart's scratch-image
+# runtime over its merged-/usr symlinks would replace system library paths.
 COPY --from=replay-build /challenge-replay /app/bin/challenge-replay
 ENV NODE_ENV=production ELEVENWARD_REPLAY_EXECUTABLE=/app/bin/challenge-replay
 USER node
+RUN node scripts/verifyChallengeExecutable.js
 CMD ["npm", "start"]
