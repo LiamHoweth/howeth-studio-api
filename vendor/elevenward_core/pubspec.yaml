@@ -1,0 +1,10 @@
+name: elevenward_core
+description: Deterministic career simulation domain for Elevenward.
+version: 0.1.0
+publish_to: none
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+
+dev_dependencies:
+  test: ^1.25.0

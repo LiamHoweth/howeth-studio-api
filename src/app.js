@@ -538,9 +538,10 @@ export function createApp({
   app.get("/api/v1/admin/feedback", requireAdmin, async (req, res, next) => {
     try {
       const status = ["new", "reviewed", "resolved"].includes(req.query.status) ? req.query.status : null;
+      const product = ["elevenward", "football_era", "studio"].includes(req.query.product) ? req.query.product : null;
       const [summary, submissions] = await Promise.all([
-        database.getFeedbackSummary(),
-        database.getFeedback({ status, limit: 100 })
+        database.getFeedbackSummary({ product }),
+        database.getFeedback({ status, product, limit: 100 })
       ]);
       return res.json({ summary, submissions });
     } catch (error) {

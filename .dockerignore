@@ -1,0 +1,7 @@
+.git
+node_modules
+.env
+.env.*
+!.env.example
+vendor/elevenward_core/.dart_tool
+vendor/elevenward_core/pubspec.lock

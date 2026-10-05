@@ -3,3 +3,7 @@ node_modules/
 .env.*
 !.env.example
 .DS_Store
+
+# Generated Dart replay build metadata
+vendor/elevenward_core/.dart_tool/
+vendor/elevenward_core/pubspec.lock
