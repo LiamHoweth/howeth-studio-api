@@ -22,6 +22,22 @@ npm run dev
 - Account/session: `GET /api/v2/account`, `POST /api/v2/auth/sign-out`, `DELETE /api/v2/account`
 - Public username: `PUT /api/v2/account/username`
 - Cloud career slots: `GET/PUT /api/v2/save-slots` (account bearer token)
+
+Football cloud readers declare `x-football-era-save-version` with their highest
+supported save-envelope version. Missing headers retain the released-client
+capability of version 8. GET and PUT refuse to return an account slot above that
+capability with HTTP 426 (`save_reader_upgrade_required`). PUT rejects replacing
+a newer stored format with an older one using HTTP 409 (`save_format_downgrade`),
+including occupied careers and deletion tombstones. Account-row serialization
+protects first inserts and makes each bulk write, compatibility check and captured
+response atomic. These guards apply only to Football `/api/v2/save-slots`;
+Elevenward's separate routes and database schema retain their existing contract.
+
+The optional actual PostgreSQL compatibility tests require an explicitly disposable
+localhost database named `football_compat_test_*`, passed through
+`FOOTBALL_COMPAT_TEST_DATABASE_URL`. They refuse existing tables and do not use
+`DATABASE_URL`. Ordinary `npm test` skips only those SQL cases when the disposable
+URL is absent.
 - Account career publication: `PUT/DELETE /api/v2/careers/:careerId`
 - Account leaderboard: `GET /api/v2/leaderboards?metric=legacy_score&position=QB`
 - Username report: `POST /api/v2/leaderboard-reports`

@@ -27,6 +27,21 @@ export function incomingCloudSaveWins(currentUpdatedAt, incomingUpdatedAt) {
   return new Date(incomingUpdatedAt).getTime() > new Date(currentUpdatedAt).getTime();
 }
 
+export function assertCloudSaveReadable(rows, readerVersion = 8) {
+  const requiredSaveVersion = Math.max(0, ...rows.map((row) => Number(row.save_version ?? row.saveVersion)));
+  if (requiredSaveVersion > readerVersion) {
+    throw Object.assign(new Error("Cloud careers require a newer save reader"), { code: "CLOUD_SAVE_UPGRADE_REQUIRED", requiredSaveVersion });
+  }
+}
+
+export function assertCloudSaveNotDowngraded(current, incoming) {
+  if (current && Number(current.save_version) > incoming.saveVersion) {
+    throw Object.assign(new Error("A newer cloud career cannot be replaced by an older save format"), {
+      code: "CLOUD_SAVE_DOWNGRADE", requiredSaveVersion: Number(current.save_version)
+    });
+  }
+}
+
 export function createDatabase(connectionString = process.env.DATABASE_URL) {
   const pool = connectionString ? new Pool({ connectionString }) : null;
 
@@ -348,17 +363,23 @@ export function createDatabase(connectionString = process.env.DATABASE_URL) {
       return result.rows;
     },
 
-    async syncCloudSaveSlots(accountId, slots) {
+    async syncCloudSaveSlots(accountId, slots, readerVersion = 8) {
       const client = await pool.connect();
       try {
         await client.query("BEGIN");
+        // The account row also serializes first inserts, for which no slot row
+        // exists to lock. All response slots must fit this caller's reader.
+        await client.query("SELECT id FROM accounts WHERE id = $1 FOR UPDATE", [accountId]);
+        const existing = await client.query(
+          "SELECT slot_index, save_version, client_updated_at FROM cloud_save_slots WHERE account_id = $1 FOR UPDATE", [accountId]
+        );
+        const byIndex = new Map(existing.rows.map((row) => [Number(row.slot_index), row]));
+        for (const slot of slots) assertCloudSaveNotDowngraded(byIndex.get(slot.slotIndex), slot);
+        assertCloudSaveReadable(existing.rows, readerVersion);
+        assertCloudSaveReadable(slots, readerVersion);
         for (const slot of slots) {
-          const current = await client.query(
-            `SELECT client_updated_at FROM cloud_save_slots
-             WHERE account_id = $1 AND slot_index = $2 FOR UPDATE`,
-            [accountId, slot.slotIndex]
-          );
-          if (!incomingCloudSaveWins(current.rows[0]?.client_updated_at, slot.updatedAt)) continue;
+          const current = byIndex.get(slot.slotIndex);
+          if (!incomingCloudSaveWins(current?.client_updated_at, slot.updatedAt)) continue;
           await client.query(
             `INSERT INTO cloud_save_slots
                (account_id, slot_index, save_version, is_occupied, payload, client_updated_at)
@@ -378,6 +399,7 @@ export function createDatabase(connectionString = process.env.DATABASE_URL) {
            FROM cloud_save_slots WHERE account_id = $1 ORDER BY slot_index`,
           [accountId]
         );
+        assertCloudSaveReadable(result.rows, readerVersion);
         await client.query("COMMIT");
         return result.rows;
       } catch (error) {

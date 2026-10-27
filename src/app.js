@@ -4,7 +4,7 @@ import express from "express";
 import { rateLimit } from "express-rate-limit";
 import helmet from "helmet";
 import { adminDashboardCss, adminDashboardJs, renderAdminDashboard } from "./adminDashboard.js";
-import { createDatabase } from "./database.js";
+import { assertCloudSaveReadable, createDatabase } from "./database.js";
 import { createElevenwardDatabase } from "./elevenwardDatabase.js";
 import { createElevenwardRouter } from "./elevenwardRoutes.js";
 import { createProviderAuth } from "./providerAuth.js";
@@ -325,23 +325,48 @@ export function createApp({
     };
   }
 
+  function cloudReaderVersion(req) {
+    const supplied = req.get("x-football-era-save-version");
+    if (supplied === undefined) return 8;
+    if (!/^[1-9]\d{0,3}$/.test(supplied)) return null;
+    const version = Number(supplied);
+    return version <= 1000 ? version : null;
+  }
+
+  function cloudCompatibilityError(error, res, next) {
+    if (error?.code === "CLOUD_SAVE_UPGRADE_REQUIRED" || error?.code === "CLOUD_SAVE_DOWNGRADE") {
+      return res.status(error.code === "CLOUD_SAVE_DOWNGRADE" ? 409 : 426).json({
+        error: error.code === "CLOUD_SAVE_DOWNGRADE" ? "save_format_downgrade" : "save_reader_upgrade_required",
+        requiredSaveVersion: error.requiredSaveVersion
+      });
+    }
+    return next(error);
+  }
+
   app.get("/api/v2/save-slots", requireAccount, async (req, res, next) => {
     try {
+      const readerVersion = cloudReaderVersion(req);
+      if (readerVersion === null) return res.status(400).json({ error: "Invalid save reader capability" });
       const rows = await database.getCloudSaveSlots(req.account.id);
+      assertCloudSaveReadable(rows, readerVersion);
       return res.json({ slots: rows.map(mapSaveSlot) });
     } catch (error) {
-      next(error);
+      return cloudCompatibilityError(error, res, next);
     }
   });
 
   app.put("/api/v2/save-slots", requireAccount, async (req, res, next) => {
     try {
+      const readerVersion = cloudReaderVersion(req);
+      if (readerVersion === null) return res.status(400).json({ error: "Invalid save reader capability" });
       const slots = validateCloudSaveSlots(req.body);
       if (!slots) return res.status(400).json({ error: "Invalid cloud save payload" });
-      const rows = await database.syncCloudSaveSlots(req.account.id, slots);
+      assertCloudSaveReadable(slots, readerVersion);
+      const rows = await database.syncCloudSaveSlots(req.account.id, slots, readerVersion);
+      assertCloudSaveReadable(rows, readerVersion);
       return res.json({ slots: rows.map(mapSaveSlot) });
     } catch (error) {
-      next(error);
+      return cloudCompatibilityError(error, res, next);
     }
   });
 

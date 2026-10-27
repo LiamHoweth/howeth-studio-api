@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 import { createApp } from "../src/app.js";
+import { assertCloudSaveNotDowngraded, assertCloudSaveReadable } from "../src/database.js";
 import { validateFeedback, validatePublicUsername, validateUsernameReport } from "../src/validation.js";
 
 const installation = { id: "11111111-1111-4111-8111-111111111111", platform: "ios", app_version: "1.2.0" };
@@ -71,8 +72,12 @@ const database = {
   async getUsernameReports() { return calls.usernameReports; },
   async resolveUsernameReport(id, action) { return { id, status: action === "suspend" ? "actioned" : "dismissed" }; },
   async getCloudSaveSlots() { return calls.saveSlots; },
-  async syncCloudSaveSlots(_accountId, slots) {
-    calls.saveSlots = slots.map((slot, index) => ({
+  async syncCloudSaveSlots(_accountId, slots, readerVersion = 8) {
+    for (const slot of slots) assertCloudSaveNotDowngraded(calls.saveSlots.find((row) => row.slot_index === slot.slotIndex), slot);
+    assertCloudSaveReadable(calls.saveSlots, readerVersion);
+    assertCloudSaveReadable(slots, readerVersion);
+    const next = new Map(calls.saveSlots.map((row) => [row.slot_index, row]));
+    slots.forEach((slot, index) => next.set(slot.slotIndex, {
       slot_index: slot.slotIndex,
       save_version: slot.saveVersion,
       is_occupied: slot.isOccupied,
@@ -81,6 +86,7 @@ const database = {
       revision: index + 1,
       server_updated_at: new Date("2026-08-22T12:00:00Z")
     }));
+    calls.saveSlots = [...next.values()];
     return calls.saveSlots;
   },
   async insertEvents(installationId, events) {
@@ -341,6 +347,40 @@ describe("Football Era API", () => {
       }] })
     });
     assert.equal(nestedEntitlementLeak.status, 400);
+  });
+
+  it("guards legacy readers, all response slots, and format downgrades without mutating saved careers", async () => {
+    const original = calls.saveSlots;
+    const updatedAt = new Date().toISOString();
+    const headers = { authorization: `Bearer ${"s".repeat(43)}`, "content-type": "application/json" };
+    const incoming = (index, version) => ({ slotIndex: index, saveVersion: version, isOccupied: true, updatedAt,
+      payload: { id: `SLOT_${index + 1}`, slotIndex: index, isOccupied: true, createdAt: updatedAt, updatedAt, player: {}, league: {} } });
+    try {
+      calls.saveSlots = [{ slot_index: 0, save_version: 9, is_occupied: true, payload: incoming(0, 9).payload,
+        client_updated_at: updatedAt, revision: 1, server_updated_at: updatedAt }];
+      const saved = JSON.stringify(calls.saveSlots);
+      const legacyRead = await fetch(`${origin}/api/v2/save-slots`, { headers });
+      assert.equal(legacyRead.status, 426);
+      assert.deepEqual(await legacyRead.json(), { error: "save_reader_upgrade_required", requiredSaveVersion: 9 });
+      assert.equal((await fetch(`${origin}/api/v2/save-slots`, { headers: { ...headers, "x-football-era-save-version": "9" } })).status, 200);
+      for (const slots of [[], [incoming(1, 8)]]) {
+        assert.equal((await fetch(`${origin}/api/v2/save-slots`, { method: "PUT", headers, body: JSON.stringify({ slots }) })).status, 426);
+        assert.equal(JSON.stringify(calls.saveSlots), saved);
+      }
+      for (const capability of [undefined, "9"]) {
+        const response = await fetch(`${origin}/api/v2/save-slots`, { method: "PUT", headers: { ...headers, ...(capability ? { "x-football-era-save-version": capability } : {}) }, body: JSON.stringify({ slots: [incoming(0, 8)] }) });
+        assert.equal(response.status, 409);
+        assert.equal((await response.json()).error, "save_format_downgrade");
+        assert.equal(JSON.stringify(calls.saveSlots), saved);
+      }
+      for (const capability of ["0", "9,8", "-1", "1001", "invalid"]) {
+        assert.equal((await fetch(`${origin}/api/v2/save-slots`, { headers: { ...headers, "x-football-era-save-version": capability } })).status, 400);
+      }
+      assert.equal((await fetch(`${origin}/api/v2/save-slots`, { method: "PUT", headers: { ...headers, "x-football-era-save-version": "9" }, body: JSON.stringify({ slots: [incoming(1, 10)] }) })).status, 426);
+      assert.equal(JSON.stringify(calls.saveSlots), saved);
+      assert.equal((await fetch(`${origin}/api/v2/save-slots`, { method: "PUT", headers: { ...headers, "x-football-era-save-version": "9" }, body: JSON.stringify({ slots: [incoming(1, 9)] }) })).status, 200);
+      assert.equal(calls.saveSlots.length, 2);
+    } finally { calls.saveSlots = original; }
   });
 
   it("revokes only the active opaque account session on sign-out", async () => {
