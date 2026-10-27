@@ -10,7 +10,41 @@ const EVENT_NAMES = new Set([
   "skill_upgraded",
   "contract_signed",
   "daily_reward_claimed",
-  "review_request_attempted"
+  "review_request_attempted",
+  "offer_eligible",
+  "offer_visible",
+  "capacity_action_visible",
+  "capacity_action_selected",
+  "product_selected",
+  "store_catalog_result",
+  "purchase_requested",
+  "purchase_outcome",
+  "purchase_verified",
+  "benefit_delivered",
+  "entitlement_reconciled",
+  "experiment_assigned",
+  "telemetry_queue_status"
+]);
+const PAID_EVENT_NAMES = new Set([
+  "offer_eligible", "offer_visible", "capacity_action_visible", "capacity_action_selected", "product_selected", "store_catalog_result",
+  "purchase_requested", "purchase_outcome", "purchase_verified", "benefit_delivered",
+  "entitlement_reconciled", "experiment_assigned", "telemetry_queue_status"
+]);
+const SHOP_ITEMS = new Set(["VIP", "DOUBLE_XP", "DOUBLE_MONEY", "EXTRA_CAREER_SLOTS", "ALL_ACCESS"]);
+const PAID_SURFACES = new Set(["shop", "boost_expiry", "career_capacity", "unknown"]);
+const PAID_OFFERS = new Set(["permanent_v1", "trial_expiry_v1", "capacity_v1"]);
+const PAID_SOURCES = new Set(["purchase", "restore", "store_sync", "recovery"]);
+const STORE_ENVIRONMENTS = new Set(["production", "sandbox", "local_test", "unknown"]);
+const ANALYTICS_ENVIRONMENTS = new Set(["production", "development", "test", "unknown"]);
+const DISTRIBUTION_CHANNELS = new Set(["app_store", "testflight", "development", "unknown"]);
+const LATENCY_BUCKETS = new Set(["under_1s", "1_to_5s", "5_to_30s", "over_30s", "unknown"]);
+const PURCHASE_OUTCOMES = new Set([
+  "cancelled", "pending", "catalog_unavailable", "configuration_error", "store_error",
+  "already_owned", "busy", "awaiting_entitlement", "verified", "recovery_required"
+]);
+const COMMITTED_EVENTS = new Set([
+  "career_started", "week_completed", "season_completed", "career_retired",
+  "life_purchase", "skill_upgraded", "contract_signed", "daily_reward_claimed"
 ]);
 
 export const LEADERBOARD_METRICS = {
@@ -59,6 +93,135 @@ function text(value, { min = 0, max = 100 } = {}) {
 
 function integer(value, { min = Number.MIN_SAFE_INTEGER, max = Number.MAX_SAFE_INTEGER } = {}) {
   return Number.isInteger(value) && value >= min && value <= max ? value : null;
+}
+
+function opaqueReference(value) {
+  return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)
+    ? value.toLowerCase() : null;
+}
+
+function validateOccurrenceContext(name, raw) {
+  const properties = isObject(raw) ? raw : {};
+  // Old queued gameplay events remain valid. New paid events must carry their
+  // occurrence context; the request's latest app-version header is never a substitute.
+  if (properties.schemaVersion === undefined) return PAID_EVENT_NAMES.has(name) ? null : {};
+  const appVersion = text(properties.appVersion, { min: 1, max: 32 });
+  const appBuild = text(properties.appBuild, { min: 1, max: 32 });
+  const sessionId = opaqueReference(properties.sessionId);
+  if (properties.schemaVersion !== 2 || !appVersion || !appBuild || !sessionId ||
+      !["ios", "android", "unknown"].includes(properties.platform) ||
+      !ANALYTICS_ENVIRONMENTS.has(properties.analyticsEnvironment) ||
+      !DISTRIBUTION_CHANNELS.has(properties.distributionChannel)) return null;
+  const commitId = properties.commitId === undefined ? undefined : opaqueReference(properties.commitId);
+  if (properties.commitId !== undefined && (!commitId || !COMMITTED_EVENTS.has(name))) return null;
+  return {
+    schemaVersion: 2, appVersion, appBuild, platform: properties.platform,
+    analyticsEnvironment: properties.analyticsEnvironment,
+    distributionChannel: properties.distributionChannel, sessionId,
+    ...(commitId ? { commitId } : {})
+  };
+}
+
+function validateExperimentContext(properties, { assignedOnly = false } = {}) {
+  const experimentId = properties.experimentId;
+  const variant = properties.variant;
+  const experimentVersion = properties.experimentVersion;
+  if (!assignedOnly && experimentId === "none" && variant === "none" && experimentVersion === 0) {
+    return { experimentId, experimentVersion, variant };
+  }
+  return ["xp_shop_copy", "career_capacity"].includes(experimentId) &&
+    ["control", "treatment"].includes(variant) && experimentVersion === 1
+    ? { experimentId, experimentVersion, variant } : null;
+}
+
+function validateOfferContext(properties) {
+  const opportunityId = opaqueReference(properties.opportunityId);
+  const presentationId = opaqueReference(properties.presentationId);
+  const experiment = validateExperimentContext(properties);
+  if (!opportunityId || !presentationId || !experiment || !SHOP_ITEMS.has(properties.itemId) ||
+      !PAID_OFFERS.has(properties.offerId) || !PAID_SURFACES.has(properties.surface)) return null;
+  return { opportunityId, presentationId, itemId: properties.itemId,
+    offerId: properties.offerId, surface: properties.surface, ...experiment };
+}
+
+function validatePaidEventProperties(name, properties) {
+  const itemId = SHOP_ITEMS.has(properties.itemId) ? properties.itemId : null;
+  const hasOfferContext = ["opportunityId", "presentationId", "offerId", "surface", "experimentId", "experimentVersion", "variant"]
+    .some((key) => properties[key] !== undefined);
+  const optionalOffer = hasOfferContext ? validateOfferContext(properties) : {};
+  switch (name) {
+    case "offer_eligible": {
+      const offer = validateOfferContext(properties);
+      return offer && ["loaded", "loading", "unavailable"].includes(properties.availability)
+        ? { ...offer, availability: properties.availability } : null;
+    }
+    case "offer_visible": return validateOfferContext(properties);
+    case "capacity_action_visible": {
+      const offer = validateOfferContext(properties);
+      return offer?.surface === "career_capacity" && offer.offerId === "capacity_v1" ? offer : null;
+    }
+    case "capacity_action_selected": {
+      const offer = validateOfferContext(properties);
+      return offer?.surface === "career_capacity" && offer.offerId === "capacity_v1" ? offer : null;
+    }
+    case "product_selected": {
+      const offer = validateOfferContext(properties);
+      const attemptId = opaqueReference(properties.attemptId);
+      return offer && attemptId ? { ...offer, attemptId } : null;
+    }
+    case "store_catalog_result": {
+      const operationId = opaqueReference(properties.operationId);
+      if (!operationId || !PAID_SURFACES.has(properties.surface) ||
+          !["complete", "partial", "empty", "failed"].includes(properties.result) ||
+          !LATENCY_BUCKETS.has(properties.latencyBucket) || !Array.isArray(properties.availableItems) ||
+          properties.availableItems.length > 5) return null;
+      return { operationId, surface: properties.surface, result: properties.result,
+        availableItems: [...new Set(properties.availableItems.filter((item) => SHOP_ITEMS.has(item)))],
+        latencyBucket: properties.latencyBucket };
+    }
+    case "purchase_requested": {
+      const attemptId = opaqueReference(properties.attemptId);
+      return attemptId && itemId && optionalOffer ? { attemptId, itemId, ...optionalOffer } : null;
+    }
+    case "purchase_outcome": {
+      const attemptId = opaqueReference(properties.attemptId);
+      return attemptId && itemId && optionalOffer && PURCHASE_OUTCOMES.has(properties.outcome)
+        ? { attemptId, itemId, outcome: properties.outcome, ...optionalOffer } : null;
+    }
+    case "purchase_verified": {
+      const saleReference = opaqueReference(properties.saleReference);
+      const attemptId = properties.attemptId === undefined ? undefined : opaqueReference(properties.attemptId);
+      if (!saleReference || !itemId || !PAID_SOURCES.has(properties.source) ||
+          !STORE_ENVIRONMENTS.has(properties.storeEnvironment) ||
+          (properties.attemptId !== undefined && !attemptId) || !optionalOffer) return null;
+      return { saleReference, itemId, source: properties.source, storeEnvironment: properties.storeEnvironment,
+        ...(attemptId ? { attemptId } : {}), ...optionalOffer };
+    }
+    case "benefit_delivered": {
+      const saleReference = opaqueReference(properties.saleReference);
+      return saleReference && itemId && optionalOffer && PAID_SOURCES.has(properties.source) && LATENCY_BUCKETS.has(properties.deliveryDelayBucket)
+        ? { saleReference, itemId, source: properties.source, deliveryDelayBucket: properties.deliveryDelayBucket, ...optionalOffer } : null;
+    }
+    case "entitlement_reconciled": {
+      const operationId = opaqueReference(properties.operationId);
+      const verifiedCount = integer(properties.verifiedCount, { min: 0, max: 5 });
+      const preservedCount = integer(properties.preservedCount, { min: 0, max: 5 });
+      return operationId && ["restore", "store_sync"].includes(properties.source) &&
+        typeof properties.storeReached === "boolean" && verifiedCount !== null && preservedCount !== null
+        ? { operationId, source: properties.source, storeReached: properties.storeReached, verifiedCount, preservedCount } : null;
+    }
+    case "experiment_assigned": {
+      const opportunityId = opaqueReference(properties.opportunityId);
+      const experiment = validateExperimentContext(properties, { assignedOnly: true });
+      return opportunityId && experiment ? { opportunityId, ...experiment } : null;
+    }
+    case "telemetry_queue_status": {
+      const droppedCount = integer(properties.droppedCount, { min: 0, max: 1_000_000 });
+      return droppedCount !== null && ["under_1h", "1h_to_1d", "1d_to_7d", "over_7d", "empty"].includes(properties.oldestAgeBucket)
+        ? { droppedCount, oldestAgeBucket: properties.oldestAgeBucket } : null;
+    }
+    default: return null;
+  }
 }
 
 function usernameSafetyKey(value) {
@@ -200,6 +363,7 @@ export function validateCloudSaveSlots(body) {
 function validateEventProperties(name, raw) {
   const properties = isObject(raw) ? raw : {};
   const position = POSITIONS.has(properties.position) ? properties.position : undefined;
+  if (PAID_EVENT_NAMES.has(name)) return validatePaidEventProperties(name, properties);
 
   switch (name) {
     case "session_started":
@@ -290,8 +454,9 @@ export function validateEvents(body) {
     if (!eventId || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(eventId)) return null;
     if (!eventName || !EVENT_NAMES.has(eventName) || !occurredAt) return null;
     const properties = validateEventProperties(eventName, raw.properties);
-    if (!properties) return null;
-    events.push({ eventId, eventName, occurredAt, properties });
+    const occurrenceContext = validateOccurrenceContext(eventName, raw.properties);
+    if (!properties || !occurrenceContext) return null;
+    events.push({ eventId, eventName, occurredAt, properties: { ...properties, ...occurrenceContext } });
   }
   return events;
 }

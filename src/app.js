@@ -111,11 +111,13 @@ export function createApp({
   const registrationLimiter = rateLimit({ windowMs: 60 * 60_000, limit: 20, standardHeaders: "draft-8", legacyHeaders: false });
   const authLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 30, standardHeaders: "draft-8", legacyHeaders: false });
   const sensitiveLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 12, standardHeaders: "draft-8", legacyHeaders: false });
+  const elevenwardReportLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 12, standardHeaders: "draft-8", legacyHeaders: false });
   const feedbackLimiter = rateLimit({ windowMs: 60 * 60_000, limit: 5, standardHeaders: "draft-8", legacyHeaders: false });
   app.use("/api/", apiLimiter);
   app.use("/v1/elevenward", apiLimiter);
   app.use("/v1/elevenward/auth", authLimiter);
   app.use("/v1/elevenward/account/deletion-confirm", sensitiveLimiter);
+  app.use("/v1/elevenward/leaderboard-reports", elevenwardReportLimiter);
 
   app.use("/v1/elevenward", createElevenwardRouter({
     database: elevenwardDatabase,

@@ -679,9 +679,9 @@ export function createDatabase(connectionString = process.env.DATABASE_URL) {
           WHERE created_at >= now() - interval '90 days'
         )
         SELECT
-          count(*) FILTER (WHERE created_at <= now() - interval '1 day')::int AS d1_eligible,
+          count(*) FILTER (WHERE created_at <= now() - interval '2 days')::int AS d1_eligible,
           count(*) FILTER (
-            WHERE created_at <= now() - interval '1 day'
+            WHERE created_at <= now() - interval '2 days'
             AND EXISTS (
               SELECT 1 FROM analytics_events e
               WHERE e.installation_id = cohort.id
@@ -689,9 +689,9 @@ export function createDatabase(connectionString = process.env.DATABASE_URL) {
               AND e.occurred_at < cohort.created_at + interval '2 days'
             )
           )::int AS d1_retained,
-          count(*) FILTER (WHERE created_at <= now() - interval '7 days')::int AS d7_eligible,
+          count(*) FILTER (WHERE created_at <= now() - interval '8 days')::int AS d7_eligible,
           count(*) FILTER (
-            WHERE created_at <= now() - interval '7 days'
+            WHERE created_at <= now() - interval '8 days'
             AND EXISTS (
               SELECT 1 FROM analytics_events e
               WHERE e.installation_id = cohort.id
@@ -699,9 +699,9 @@ export function createDatabase(connectionString = process.env.DATABASE_URL) {
               AND e.occurred_at < cohort.created_at + interval '8 days'
             )
           )::int AS d7_retained,
-          count(*) FILTER (WHERE created_at <= now() - interval '30 days')::int AS d30_eligible,
+          count(*) FILTER (WHERE created_at <= now() - interval '31 days')::int AS d30_eligible,
           count(*) FILTER (
-            WHERE created_at <= now() - interval '30 days'
+            WHERE created_at <= now() - interval '31 days'
             AND EXISTS (
               SELECT 1 FROM analytics_events e
               WHERE e.installation_id = cohort.id
@@ -715,7 +715,7 @@ export function createDatabase(connectionString = process.env.DATABASE_URL) {
         SELECT date_trunc('day', occurred_at)::date AS day,
                count(DISTINCT installation_id)::int AS active_installations
         FROM analytics_events
-        WHERE occurred_at >= now() - interval '30 days'
+        WHERE occurred_at >= now() - interval '30 days' AND occurred_at <= now()
         GROUP BY 1
         ORDER BY 1
       `);
@@ -731,7 +731,7 @@ export function createDatabase(connectionString = process.env.DATABASE_URL) {
           GROUP BY event_name
         ), total AS (SELECT count(*)::int AS installations FROM installations)
         SELECT stage, label, count FROM (
-          SELECT 1 AS stage, 'Installed' AS label, (SELECT installations FROM total) AS count
+          SELECT 1 AS stage, 'Consented registered installations' AS label, (SELECT installations FROM total) AS count
           UNION ALL SELECT 2, 'Career started', COALESCE((SELECT installations FROM event_counts WHERE event_name='career_started'),0)
           UNION ALL SELECT 3, 'Week completed', COALESCE((SELECT installations FROM event_counts WHERE event_name='week_completed'),0)
           UNION ALL SELECT 4, 'Season completed', COALESCE((SELECT installations FROM event_counts WHERE event_name='season_completed'),0)
@@ -739,12 +739,236 @@ export function createDatabase(connectionString = process.env.DATABASE_URL) {
         ) steps ORDER BY stage
       `);
       const installed = Number(result.rows[0]?.count ?? 0);
-      return result.rows.map((row) => ({
+      const careerSteps = result.rows.map((row) => ({
+        group: "career_activity",
         stage: row.stage,
         label: row.label,
         installations: Number(row.count),
         conversion: installed > 0 ? Number((Number(row.count) / installed).toFixed(4)) : null
       }));
+      // Occurrence metadata is captured before queueing. Never join the latest
+      // installation version to historical offers or treat restores as sales.
+      const paid = await pool.query(`
+        WITH paid_events AS (
+          SELECT id, installation_id, event_name, occurred_at, properties
+          FROM analytics_events
+          WHERE occurred_at >= now() - interval '90 days' AND occurred_at <= now()
+          AND properties->>'schemaVersion' = '2'
+          AND event_name IN ('offer_eligible','offer_visible','product_selected',
+            'purchase_requested','purchase_verified','benefit_delivered')
+        ), attempt_selections AS (
+          SELECT DISTINCT ON (installation_id, properties->>'attemptId', properties->>'itemId') *
+          FROM paid_events WHERE event_name = 'product_selected'
+          ORDER BY installation_id, properties->>'attemptId', properties->>'itemId', occurred_at, id
+        ), verifications AS (
+          SELECT DISTINCT ON (installation_id, properties->>'saleReference', properties->>'itemId') *
+          FROM paid_events WHERE event_name = 'purchase_verified'
+          ORDER BY installation_id, properties->>'saleReference', properties->>'itemId', occurred_at, id
+        ), eligible AS (
+          SELECT DISTINCT ON (installation_id, properties->>'opportunityId', properties->>'itemId') *
+          FROM paid_events
+          WHERE event_name = 'offer_eligible'
+          AND properties->>'opportunityId' IS NOT NULL AND properties->>'itemId' IS NOT NULL
+          ORDER BY installation_id, properties->>'opportunityId', properties->>'itemId', occurred_at, id
+        ), milestones AS (
+          SELECT e.id, e.properties,
+            bool_or(v.id IS NOT NULL) AS visible,
+            bool_or(r.id IS NOT NULL) AS requested,
+            bool_or(p.id IS NOT NULL) AS verified,
+            bool_or(d.id IS NOT NULL) AS delivered
+          FROM eligible e
+          LEFT JOIN paid_events v ON v.installation_id = e.installation_id
+            AND v.event_name = 'offer_visible' AND v.occurred_at >= e.occurred_at
+            AND v.properties->>'opportunityId' = e.properties->>'opportunityId'
+            AND v.properties->>'itemId' = e.properties->>'itemId'
+            AND ((v.properties->>'offerId' = e.properties->>'offerId'
+              AND v.properties->>'surface' = e.properties->>'surface') OR (
+              e.properties->>'experimentId' = 'career_capacity'
+              AND e.properties->>'experimentVersion' = '1'
+              AND e.properties->>'offerId' = 'capacity_v1' AND e.properties->>'surface' = 'career_capacity'
+              AND v.properties->>'offerId' = 'permanent_v1' AND v.properties->>'surface' = 'shop'))
+            AND v.properties->>'experimentId' = e.properties->>'experimentId'
+            AND v.properties->>'experimentVersion' = e.properties->>'experimentVersion'
+            AND v.properties->>'variant' = e.properties->>'variant'
+            AND v.properties->>'analyticsEnvironment' = e.properties->>'analyticsEnvironment'
+          LEFT JOIN attempt_selections s ON s.installation_id = e.installation_id
+            AND s.event_name = 'product_selected' AND s.occurred_at >= v.occurred_at
+            AND s.properties->>'presentationId' = v.properties->>'presentationId'
+            AND s.properties->>'opportunityId' = e.properties->>'opportunityId'
+            AND s.properties->>'itemId' = e.properties->>'itemId'
+            AND s.properties->>'offerId' = v.properties->>'offerId'
+            AND s.properties->>'surface' = v.properties->>'surface'
+            AND s.properties->>'experimentId' = v.properties->>'experimentId'
+            AND s.properties->>'experimentVersion' = v.properties->>'experimentVersion'
+            AND s.properties->>'variant' = v.properties->>'variant'
+            AND s.properties->>'analyticsEnvironment' = e.properties->>'analyticsEnvironment'
+          LEFT JOIN paid_events r ON r.installation_id = e.installation_id
+            AND r.event_name = 'purchase_requested' AND r.occurred_at >= s.occurred_at
+            AND r.properties->>'attemptId' = s.properties->>'attemptId'
+            AND r.properties->>'itemId' = e.properties->>'itemId'
+            AND r.properties->>'analyticsEnvironment' = e.properties->>'analyticsEnvironment'
+          LEFT JOIN verifications p ON p.installation_id = e.installation_id
+            AND p.event_name = 'purchase_verified' AND p.occurred_at >= r.occurred_at
+            AND p.properties->>'attemptId' = r.properties->>'attemptId'
+            AND p.properties->>'itemId' = e.properties->>'itemId'
+            AND p.properties->>'source' = 'purchase'
+            AND p.properties->>'analyticsEnvironment' = 'production'
+            AND e.properties->>'analyticsEnvironment' = 'production'
+            AND p.properties->>'storeEnvironment' = 'production'
+          LEFT JOIN paid_events d ON d.installation_id = e.installation_id
+            AND d.event_name = 'benefit_delivered' AND d.occurred_at >= p.occurred_at
+            AND d.properties->>'saleReference' = p.properties->>'saleReference'
+            AND d.properties->>'itemId' = e.properties->>'itemId'
+            AND d.properties->>'source' = 'purchase'
+            AND d.properties->>'analyticsEnvironment' = 'production'
+          GROUP BY e.id, e.properties
+        )
+        SELECT properties->>'analyticsEnvironment' AS analytics_environment,
+          properties->>'appVersion' AS app_version, properties->>'appBuild' AS app_build,
+          properties->>'distributionChannel' AS distribution_channel,
+          properties->>'experimentId' AS experiment_id,
+          properties->>'experimentVersion' AS experiment_version,
+          properties->>'variant' AS variant, properties->>'surface' AS surface,
+          properties->>'itemId' AS item_id,
+          count(*)::int AS eligible_count,
+          count(*) FILTER (WHERE visible)::int AS visible_count,
+          count(*) FILTER (WHERE requested)::int AS requested_count,
+          count(*) FILTER (WHERE verified)::int AS verified_count,
+          count(*) FILTER (WHERE delivered)::int AS delivered_count
+        FROM milestones
+        GROUP BY 1,2,3,4,5,6,7,8,9 ORDER BY 1,2,3,4,5,6,7,8,9
+      `);
+      const paidSteps = paid.rows.flatMap((row) => {
+        const counts = [row.eligible_count, row.visible_count, row.requested_count, row.verified_count, row.delivered_count];
+        const labels = ["Eligible opportunities", "Actually visible", "Native request", "Production verified", "Durably delivered"];
+        return counts.map((count, index) => ({
+          group: row.analytics_environment === "production" ? "paid_opportunity" : "quarantined_opportunity",
+          stage: index + 1, label: labels[index], opportunities: Number(count),
+          conversion: Number(row.eligible_count) > 0 ? Number((Number(count) / Number(row.eligible_count)).toFixed(4)) : null,
+          analyticsEnvironment: row.analytics_environment, appVersion: row.app_version, appBuild: row.app_build,
+          distributionChannel: row.distribution_channel, experimentId: row.experiment_id,
+          experimentVersion: Number(row.experiment_version), variant: row.variant, surface: row.surface, itemId: row.item_id
+        }));
+      });
+      // Assignment is installation-scoped. A control player who later opens the
+      // Shop normally can buy under a different opportunity; that still belongs
+      // to the assigned directional 35-day cohort, including all SKUs.
+      const cohorts = await pool.query(`
+        WITH assignments AS (
+          SELECT DISTINCT ON (installation_id, properties->>'experimentId', properties->>'experimentVersion') *
+          FROM analytics_events
+          WHERE event_name = 'experiment_assigned' AND properties->>'schemaVersion' = '2'
+            AND properties->>'analyticsEnvironment' = 'production'
+            AND occurred_at >= now() - interval '90 days' AND occurred_at <= now()
+            AND received_at <= occurred_at + interval '49 days'
+          ORDER BY installation_id, properties->>'experimentId', properties->>'experimentVersion', occurred_at, id
+        ), enrollment AS (
+          SELECT a.id, a.installation_id, a.properties, min(e.occurred_at) AS enrolled_at
+          FROM assignments a JOIN analytics_events e ON e.installation_id = a.installation_id
+            AND e.event_name = 'offer_eligible' AND e.occurred_at >= a.occurred_at
+            AND e.received_at <= e.occurred_at + interval '49 days'
+            AND e.properties->>'analyticsEnvironment' = 'production'
+            AND e.properties->>'opportunityId' = a.properties->>'opportunityId'
+            AND e.properties->>'experimentId' = a.properties->>'experimentId'
+            AND e.properties->>'experimentVersion' = a.properties->>'experimentVersion'
+            AND e.properties->>'variant' = a.properties->>'variant'
+          GROUP BY a.id, a.installation_id, a.properties
+        ), verified AS (
+          SELECT DISTINCT ON (installation_id, properties->>'saleReference', properties->>'itemId') *
+          FROM analytics_events WHERE event_name = 'purchase_verified'
+            AND properties->>'schemaVersion' = '2'
+          ORDER BY installation_id, properties->>'saleReference', properties->>'itemId', occurred_at, id
+        ), observations AS (
+          SELECT c.id, c.properties, c.enrolled_at,
+            bool_or(p.id IS NOT NULL) AS verified_buyer,
+            bool_or(d.id IS NOT NULL) AS delivered_buyer,
+            array_agg(DISTINCT p.properties->>'itemId') FILTER (WHERE d.id IS NOT NULL) AS delivered_items
+          FROM enrollment c LEFT JOIN verified p ON p.installation_id = c.installation_id
+            AND p.occurred_at >= c.enrolled_at AND p.occurred_at < c.enrolled_at + interval '35 days'
+            AND p.received_at <= c.enrolled_at + interval '49 days'
+            AND p.properties->>'analyticsEnvironment' = 'production'
+            AND p.properties->>'storeEnvironment' = 'production' AND p.properties->>'source' = 'purchase'
+          LEFT JOIN analytics_events d ON d.installation_id = c.installation_id
+            AND d.event_name = 'benefit_delivered' AND d.occurred_at >= p.occurred_at
+            AND d.occurred_at < c.enrolled_at + interval '35 days'
+            AND d.received_at <= c.enrolled_at + interval '49 days'
+            AND d.properties->>'saleReference' = p.properties->>'saleReference'
+            AND d.properties->>'itemId' = p.properties->>'itemId'
+            AND d.properties->>'analyticsEnvironment' = 'production' AND d.properties->>'source' = 'purchase'
+          GROUP BY c.id, c.properties, c.enrolled_at
+        )
+        SELECT properties->>'experimentId' AS experiment_id,
+          properties->>'experimentVersion' AS experiment_version, properties->>'variant' AS variant,
+          properties->>'appVersion' AS app_version, properties->>'appBuild' AS app_build,
+          properties->>'distributionChannel' AS distribution_channel,
+          count(*)::int AS enrolled,
+          count(*) FILTER (WHERE enrolled_at <= now() - interval '35 days')::int AS mature_35,
+          count(*) FILTER (WHERE enrolled_at <= now() - interval '49 days')::int AS final_49,
+          count(*) FILTER (WHERE enrolled_at <= now() - interval '35 days' AND verified_buyer)::int AS verified_buyers_35,
+          count(*) FILTER (WHERE enrolled_at <= now() - interval '35 days' AND delivered_buyer)::int AS delivered_buyers_35,
+          count(*) FILTER (WHERE enrolled_at <= now() - interval '49 days' AND delivered_buyer)::int AS delivered_buyers_final,
+          count(*) FILTER (WHERE enrolled_at <= now() - interval '35 days' AND 'VIP' = ANY(delivered_items))::int AS vip_buyers,
+          count(*) FILTER (WHERE enrolled_at <= now() - interval '35 days' AND 'DOUBLE_XP' = ANY(delivered_items))::int AS xp_buyers,
+          count(*) FILTER (WHERE enrolled_at <= now() - interval '35 days' AND 'DOUBLE_MONEY' = ANY(delivered_items))::int AS money_buyers,
+          count(*) FILTER (WHERE enrolled_at <= now() - interval '35 days' AND 'EXTRA_CAREER_SLOTS' = ANY(delivered_items))::int AS slots_buyers,
+          count(*) FILTER (WHERE enrolled_at <= now() - interval '35 days' AND 'ALL_ACCESS' = ANY(delivered_items))::int AS all_access_buyers
+        FROM observations GROUP BY 1,2,3,4,5,6 ORDER BY 1,2,3,4,5,6
+      `);
+      const cohortRows = cohorts.rows.map((row) => ({
+        group: "assigned_35_day_cohort", experimentId: row.experiment_id,
+        experimentVersion: Number(row.experiment_version), variant: row.variant,
+        appVersion: row.app_version, appBuild: row.app_build, distributionChannel: row.distribution_channel,
+        enrolled: Number(row.enrolled), mature35: Number(row.mature_35), final49: Number(row.final_49),
+        verifiedBuyers35: Number(row.verified_buyers_35), deliveredBuyers35: Number(row.delivered_buyers_35),
+        deliveredBuyersFinal: Number(row.delivered_buyers_final),
+        conversion35: Number(row.mature_35) > 0 ? Number((Number(row.delivered_buyers_35) / Number(row.mature_35)).toFixed(4)) : null,
+        conversionFinal: Number(row.final_49) > 0 ? Number((Number(row.delivered_buyers_final) / Number(row.final_49)).toFixed(4)) : null,
+        deliveredSkuBuyers35: { VIP: Number(row.vip_buyers), DOUBLE_XP: Number(row.xp_buyers),
+          DOUBLE_MONEY: Number(row.money_buyers), EXTRA_CAREER_SLOTS: Number(row.slots_buyers), ALL_ACCESS: Number(row.all_access_buyers) }
+      }));
+      const diagnostics = await pool.query(`
+        WITH verified AS (
+          SELECT DISTINCT ON (installation_id, properties->>'saleReference', properties->>'itemId') *
+          FROM analytics_events
+          WHERE event_name = 'purchase_verified' AND properties->>'schemaVersion' = '2'
+          AND occurred_at >= now() - interval '90 days' AND occurred_at <= now()
+          ORDER BY installation_id, properties->>'saleReference', properties->>'itemId', occurred_at, id
+        ), queue_status AS (
+          SELECT DISTINCT ON (installation_id) * FROM analytics_events
+          WHERE event_name = 'telemetry_queue_status' AND properties->>'schemaVersion' = '2'
+          AND occurred_at >= now() - interval '90 days' AND occurred_at <= now()
+          ORDER BY installation_id, occurred_at DESC, id DESC
+        )
+        SELECT 'verification_context' AS diagnostic, properties->>'analyticsEnvironment' AS analytics_environment,
+          properties->>'storeEnvironment' AS store_environment, properties->>'source' AS source,
+          properties->>'appVersion' AS app_version, properties->>'appBuild' AS app_build,
+          count(*)::bigint AS count
+        FROM verified GROUP BY 2,3,4,5,6
+        UNION ALL
+        SELECT 'reported_queue_drops', properties->>'analyticsEnvironment', NULL, NULL,
+          properties->>'appVersion', properties->>'appBuild', sum((properties->>'droppedCount')::bigint)
+        FROM queue_status GROUP BY 2,5,6
+        UNION ALL
+        SELECT 'events_arrived_after_24h', COALESCE(properties->>'analyticsEnvironment','legacy_unknown'), NULL, NULL,
+          COALESCE(properties->>'appVersion','unknown'), COALESCE(properties->>'appBuild','unknown'), count(*)::bigint
+        FROM analytics_events
+        WHERE occurred_at >= now() - interval '90 days' AND occurred_at <= now()
+          AND received_at > occurred_at + interval '24 hours'
+        GROUP BY 2,5,6
+        UNION ALL
+        SELECT event_name, properties->>'analyticsEnvironment', NULL, NULL,
+          properties->>'appVersion', properties->>'appBuild',
+          count(DISTINCT (installation_id, properties->>'presentationId', properties->>'itemId'))::bigint
+        FROM analytics_events WHERE event_name IN ('capacity_action_visible','capacity_action_selected')
+          AND properties->>'schemaVersion' = '2'
+          AND occurred_at >= now() - interval '90 days' AND occurred_at <= now()
+        GROUP BY 1,2,5,6
+      `);
+      return [...careerSteps, ...paidSteps, ...cohortRows, ...diagnostics.rows.map((row) => ({
+        group: "measurement_diagnostic", label: row.diagnostic, count: Number(row.count),
+        analyticsEnvironment: row.analytics_environment, storeEnvironment: row.store_environment,
+        source: row.source, appVersion: row.app_version, appBuild: row.app_build
+      }))];
     },
 
     async getBalance() {

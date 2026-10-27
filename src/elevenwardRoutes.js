@@ -14,12 +14,18 @@ import {
   validateRevenueCatEvent,
   validateSyncRequest
 } from "./elevenwardValidation.js";
-import { validateProviderCredential } from "./validation.js";
+import { validateProviderCredential, validatePublicUsername, validateUsernameReport } from "./validation.js";
 
 const SESSION_DAYS = 90;
 
 function hash(value) {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function leaderboardAlias(account, careerId, position) {
+  return account.public_username && !account.username_suspended_at
+    ? account.public_username
+    : `${position} Player ${hash(`${account.id}:${careerId}`).slice(0, 6).toUpperCase()}`;
 }
 
 function bearer(req) {
@@ -73,6 +79,22 @@ function releaseResponse(row) {
     assets: [{ kind: "content-bundle", url: row.public_url, checksum: `sha256:${row.checksum}` }],
     status: row.status,
     publishedAt: row.published_at ? new Date(row.published_at).toISOString() : null
+  };
+}
+
+function publicAccount(account) {
+  const suspended = Boolean(account.username_suspended_at);
+  const publicUsername = suspended ? null : account.public_username ?? null;
+  return {
+    id: account.id,
+    alias: account.alias,
+    provider: account.provider,
+    email: account.email ?? account.verified_email ?? null,
+    publicUsername,
+    usernameStatus: suspended ? "suspended" : publicUsername ? "active" : "unset",
+    usernameCanChangeAt: publicUsername && account.username_updated_at
+      ? new Date(new Date(account.username_updated_at).getTime() + 30 * 86_400_000).toISOString()
+      : null
   };
 }
 
@@ -140,7 +162,7 @@ export function createElevenwardRouter({
       const expiresAt = new Date(Date.now() + SESSION_DAYS * 86_400_000);
       const account = await database.createAccountSession({ identity, tokenHash: hash(token), expiresAt });
       return res.json({
-        account: { id: account.id, alias: account.alias, provider: account.provider, email: account.email ?? null },
+        account: publicAccount(account),
         accessToken: token,
         expiresAt: expiresAt.toISOString()
       });
@@ -158,9 +180,35 @@ export function createElevenwardRouter({
   router.get("/account", requireAccount, (req, res) => {
     const account = req.elevenwardAccount;
     res.json({
-      account: { id: account.id, alias: account.alias, provider: account.provider, email: account.verified_email ?? null },
+      account: publicAccount(account),
       expiresAt: new Date(account.expires_at).toISOString()
     });
+  });
+
+  router.put("/account/username", requireAccount, async (req, res, next) => {
+    try {
+      const validation = validatePublicUsername(req.body?.username);
+      const productNameKey = validation.ok ? validation.normalized
+        .replaceAll("0", "o").replaceAll("1", "l").replaceAll("3", "e")
+        .replaceAll("4", "a").replaceAll("5", "s").replaceAll("7", "t")
+        .replaceAll("_", "") : null;
+      if (!validation.ok || ["elevenward", "elevenwardofficial"].includes(productNameKey)) {
+        return res.status(422).json({ error: validation.ok ? "username_reserved" : validation.reason });
+      }
+      const result = await database.setPublicUsername(
+        req.elevenwardAccount.id, validation.username, validation.normalized
+      );
+      if (result.status === "taken") return res.status(409).json({ error: "username_taken" });
+      if (result.status === "cooldown") return res.status(429).json({ error: "username_cooldown", usernameCanChangeAt: result.canChangeAt });
+      if (result.status === "suspended") return res.status(403).json({ error: "username_suspended" });
+      if (result.status !== "updated") return res.status(404).json({ error: "account_not_found" });
+      return res.json({
+        account: publicAccount({ ...req.elevenwardAccount, ...result.account }),
+        expiresAt: new Date(req.elevenwardAccount.expires_at).toISOString()
+      });
+    } catch (error) {
+      return next(error);
+    }
   });
 
   router.post("/auth/sign-out", requireAccount, async (req, res, next) => {
@@ -291,10 +339,12 @@ export function createElevenwardRouter({
         slotIndex,
         req.params.conflictId,
         resolution.choice,
+        resolution.publishLeaderboard,
         (snapshot) => validateSyncRequest(slotIndex, {
           baseRevision: 0,
           idempotencyKey: "00000000-0000-4000-8000-000000000000",
-          snapshot
+          snapshot,
+          publishLeaderboard: resolution.publishLeaderboard
         })
       );
       return slot === undefined
@@ -358,21 +408,21 @@ export function createElevenwardRouter({
       const submission = validateLeaderboardSubmission(req.body);
       if (!submission) return res.status(400).json({ error: "Invalid LeaderboardSubmission" });
       const rejection = leaderboardRejection(submission);
-      await database.upsertLeaderboardSubmission(
-        req.elevenwardAccount.id,
-        req.elevenwardAccount.alias,
-        submission,
-        rejection
-      );
-      return rejection
-        ? res.status(422).json({ error: "Submission rejected", reason: rejection })
-        : res.status(202).json({ accepted: true, alias: req.elevenwardAccount.alias });
+      if (rejection) return res.status(422).json({ error: "Submission rejected", reason: rejection });
+      const result = await database.upsertLeaderboardSubmission(req.elevenwardAccount.id, submission);
+      if (result.status === "missing") return res.status(404).json({ error: "career_not_synced" });
+      if (result.status === "stale") return res.status(409).json({ error: "career_snapshot_changed" });
+      if (result.status === "invalid") return res.status(422).json({ error: "Career is not eligible for the leaderboard" });
+      return res.status(202).json({
+        accepted: true,
+        alias: leaderboardAlias(req.elevenwardAccount, submission.careerId, submission.position)
+      });
     } catch (error) {
       return next(error);
     }
   });
 
-  router.get("/leaderboards", async (req, res, next) => {
+  router.get("/leaderboards", requireAccount, async (req, res, next) => {
     try {
       const query = validateLeaderboardQuery(req.query);
       if (!query) return res.status(400).json({ error: "position, difficulty, and rulesVersion are required" });
@@ -382,6 +432,9 @@ export function createElevenwardRouter({
         entries: rows.map((row, index) => ({
           rank: index + 1,
           alias: row.alias,
+          profileId: row.public_profile_id,
+          isCurrentUser: row.account_id === req.elevenwardAccount.id,
+          reportable: Boolean(row.reportable) && row.account_id !== req.elevenwardAccount.id,
           careerId: row.career_id,
           legacyScore: Number(row.legacy_score),
           aggregateMetrics: row.aggregate_metrics,
@@ -389,6 +442,41 @@ export function createElevenwardRouter({
         })),
         notice: "Offline careers cannot be perfectly cheat-proof; this board awards no prizes."
       });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  router.post("/leaderboard-reports", requireAccount, async (req, res, next) => {
+    try {
+      const report = validateUsernameReport(req.body);
+      if (!report) return res.status(400).json({ error: "Invalid report payload" });
+      const result = await database.createUsernameReport(req.elevenwardAccount.id, report.profileId, report.reason);
+      if (result.status === "self") return res.status(400).json({ error: "cannot_report_self" });
+      if (result.status === "missing") return res.status(404).json({ error: "profile_not_found" });
+      return res.status(result.status === "created" ? 202 : 200).json({ received: true });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  router.get("/admin/username-reports", requireStaff, async (req, res, next) => {
+    try {
+      const status = ["new", "dismissed", "actioned"].includes(req.query.status) ? req.query.status : "new";
+      return res.json({ reports: await database.getUsernameReports({ status, limit: 100 }) });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  router.patch("/admin/username-reports/:id", requireStaff, async (req, res, next) => {
+    try {
+      const action = req.body?.action;
+      if (!["dismiss", "suspend", "restore"].includes(action)) {
+        return res.status(400).json({ error: "Invalid moderation action" });
+      }
+      const updated = await database.resolveUsernameReport(req.params.id, action);
+      return updated ? res.json(updated) : res.status(404).json({ error: "Report not found" });
     } catch (error) {
       return next(error);
     }

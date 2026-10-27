@@ -83,6 +83,7 @@ export function sha256(value) {
 
 export function validateSyncRequest(slotParam, body) {
   if (!object(body) || !object(body.snapshot)) return null;
+  if (body.publishLeaderboard != null && typeof body.publishLeaderboard !== "boolean") return null;
   const slotIndex = int(Number(slotParam), 0, 4);
   const baseRevision = int(body.baseRevision, 0, Number.MAX_SAFE_INTEGER);
   const idempotencyKey = uuid(body.idempotencyKey);
@@ -107,12 +108,77 @@ export function validateSyncRequest(slotParam, body) {
   return {
     slotIndex, baseRevision, idempotencyKey, snapshot, careerId, schemaVersion,
     rulesVersion, contentVersion, position, difficulty, seed, updatedAt,
-    checksum: sha256(encoded), requestHash: sha256({ slotIndex, baseRevision, snapshot })
+    publishLeaderboard: body.publishLeaderboard === true,
+    checksum: sha256(encoded),
+    requestHash: sha256(body.publishLeaderboard == null
+      ? { slotIndex, baseRevision, snapshot }
+      : { slotIndex, baseRevision, snapshot, publishLeaderboard: body.publishLeaderboard })
   };
 }
 
 export function validateConflictResolution(body) {
-  return object(body) && ["local", "remote"].includes(body.choice) ? { choice: body.choice } : null;
+  return object(body) && ["local", "remote"].includes(body.choice) &&
+    (body.publishLeaderboard == null || typeof body.publishLeaderboard === "boolean")
+    ? { choice: body.choice, publishLeaderboard: body.publishLeaderboard === true } : null;
+}
+
+const OVERALL_WEIGHTS = {
+  striker: { finishing: .27, composure: .18, technique: .16, pace: .14, strength: .09, stamina: .07, passing: .06, defending: .03 },
+  winger: { pace: .23, technique: .22, passing: .16, composure: .11, finishing: .11, stamina: .09, strength: .05, defending: .03 },
+  midfielder: { passing: .23, technique: .20, stamina: .15, composure: .13, defending: .10, pace: .08, strength: .07, finishing: .04 },
+  defender: { defending: .27, strength: .19, composure: .15, passing: .11, pace: .10, stamina: .09, technique: .06, finishing: .03 }
+};
+
+// Read only bounded career aggregates from the saved snapshot. The server never
+// uses a separately supplied leaderboard score or a player's free-text name.
+export function leaderboardSubmissionFromSync(sync) {
+  const snapshot = sync.snapshot;
+  const player = snapshot.player;
+  const history = snapshot.seasonHistory;
+  if (!object(player) || !object(player.attributes) || !Array.isArray(history) || history.length > 20) return null;
+  const appearances = int(player.appearances, 0, 800);
+  const goals = int(player.goals, 0, 5000);
+  const assists = int(player.assists, 0, 5000);
+  const reputation = int(player.reputation, 0, 100);
+  if ([appearances, goals, assists, reputation].some((value) => value == null)) return null;
+  let weightedOverall = 0;
+  for (const [attribute, weight] of Object.entries(OVERALL_WEIGHTS[sync.position])) {
+    const value = int(player.attributes[attribute], 1, 99);
+    if (value == null) return null;
+    weightedOverall += value * weight;
+  }
+  let trophies = 0;
+  let ratings = 0;
+  for (const season of history) {
+    if (!object(season) || !Array.isArray(season.trophies) || season.trophies.length > 10 ||
+        typeof season.averageRating !== "number" || !Number.isFinite(season.averageRating) ||
+        season.averageRating < 0 || season.averageRating > 10) return null;
+    trophies += season.trophies.length;
+    ratings += season.averageRating;
+  }
+  const averageRating = history.length ? ratings / history.length : 0;
+  const currentSeason = snapshot.season == null ? history.length + 1 : int(snapshot.season, 1, 21);
+  if (currentSeason == null) return null;
+  const seasons = Math.min(20, Math.max(1, history.length, currentSeason));
+  const legacyScore = Math.round(
+    appearances * 4 + goals * 12 + assists * 8 + trophies * 180 +
+    reputation * 9 + Math.round(weightedOverall) * 5 + averageRating * 75
+  );
+  const submission = validateLeaderboardSubmission({
+    careerId: sync.careerId,
+    position: sync.position,
+    difficulty: sync.difficulty,
+    rulesVersion: sync.rulesVersion,
+    aggregateMetrics: { seasons, matches: appearances, legacyScore, goals, assists, trophies },
+    validationEvidence: {
+      seed: sync.seed,
+      finalRevision: Math.max(1, snapshot.revision),
+      snapshotChecksum: sync.checksum,
+      boostIdsUsed: snapshot.boostIdsUsed ?? [],
+      developmentProgress: snapshot.developmentProgress ?? {}
+    }
+  });
+  return submission && !leaderboardRejection(submission) ? submission : null;
 }
 
 export function validateLeaderboardSubmission(body) {
