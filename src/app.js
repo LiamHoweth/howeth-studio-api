@@ -1,3 +1,4 @@
+import { validateGrowthFilters } from "./growthValidation.js";
 import { adminApps } from "./adminApps.js";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import cors from "cors";
@@ -485,6 +486,12 @@ export function createApp({
     } catch (error) {
       next(error);
     }
+  });
+
+  app.get("/api/v1/admin/stats/growth", requireAdmin, async (req, res, next) => {
+    const filters = validateGrowthFilters(req.query);
+    if (!filters) return res.status(400).json({ error: "Invalid growth filters" });
+    try { res.json(await database.getGrowthStats(filters)); } catch (error) { next(error); }
   });
 
   app.get("/api/v1/admin/stats/overview", requireAdmin, async (_req, res, next) => {
