@@ -95,3 +95,18 @@ ELEVENWARD_REPLAY_EXECUTABLE=/path/to/compiled-helper TASK_TEST_DATABASE_URL=pos
 The `linux-runtime` CI job builds the production Dockerfile and runs these checks
 inside the Linux image against a disposable PostgreSQL 17 service. It requires no
 production credentials and does not deploy to Railway.
+
+## Private studio console
+
+`/admin` uses the existing dashboard credentials and provides a shared app
+workspace, feedback inbox and app-scoped username moderation. The app directory
+is declared in `src/adminApps.js`; update this inventory when projects change.
+A project can be listed before its backend is connected. Only configured adapters
+request data: Football Era aggregates remain Football-only, and Elevenward uses
+its existing operations, content release and moderation APIs. Other projects show
+an explicit missing-connection state, never another app's metrics or invented zeros.
+
+Console HTML, CSS and browser behavior are in `src/adminDashboard.js` and
+`src/admin/`. The protected `GET /api/v1/admin/apps` supplies the capability map.
+The shared feedback GET accepts an exact catalog `product` ID; unknown or malformed
+filters return 400. Omitting `product` selects the existing shared inbox.
