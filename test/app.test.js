@@ -531,7 +531,7 @@ describe("Football Era API", () => {
       headers: { authorization: `Basic ${Buffer.from("developer:test-dashboard-password").toString("base64")}` }
     });
     assert.equal(authorized.status, 200);
-    assert.match(await authorized.text(), /Football Era telemetry/);
+    assert.match(await authorized.text(), /Beopity — Studio Console/);
   });
 });
 

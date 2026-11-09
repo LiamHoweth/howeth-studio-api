@@ -1,3 +1,4 @@
+import { adminApps } from "./adminApps.js";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import cors from "cors";
 import express from "express";
@@ -164,7 +165,7 @@ export function createApp({
       secureEqual(basic.username, env.ADMIN_DASHBOARD_USER) &&
       secureEqual(basic.password, env.ADMIN_DASHBOARD_PASSWORD)
     ) return next();
-    res.set("WWW-Authenticate", 'Basic realm="Football Era developer dashboard", charset="UTF-8"');
+    res.set("WWW-Authenticate", 'Basic realm="Beopity Studio Console", charset="UTF-8"');
     return res.status(401).json({ error: "Unauthorized" });
   }
 
@@ -175,7 +176,7 @@ export function createApp({
       secureEqual(basic.username, env.ADMIN_DASHBOARD_USER) &&
       secureEqual(basic.password, env.ADMIN_DASHBOARD_PASSWORD)
     ) return next();
-    res.set("WWW-Authenticate", 'Basic realm="Football Era developer dashboard", charset="UTF-8"');
+    res.set("WWW-Authenticate", 'Basic realm="Beopity Studio Console", charset="UTF-8"');
     return res.status(401).send("Authentication required");
   }
 
@@ -538,7 +539,13 @@ export function createApp({
   app.get("/api/v1/admin/feedback", requireAdmin, async (req, res, next) => {
     try {
       const status = ["new", "reviewed", "resolved"].includes(req.query.status) ? req.query.status : null;
-      const product = ["elevenward", "football_era", "studio"].includes(req.query.product) ? req.query.product : null;
+      const requestedProduct = req.query.product;
+      // Reject unknown filters rather than silently returning every app's inbox.
+      if (Object.keys(req.query).some(key => !["product", "status"].includes(key)) ||
+          (requestedProduct !== undefined && !adminApps.some(app => app.id === requestedProduct))) {
+        return res.status(400).json({ error: "Unknown app" });
+      }
+      const product = requestedProduct ?? null;
       const [summary, submissions] = await Promise.all([
         database.getFeedbackSummary({ product }),
         database.getFeedback({ status, product, limit: 100 })
@@ -578,6 +585,11 @@ export function createApp({
     } catch (error) {
       next(error);
     }
+  });
+
+  app.get("/api/v1/admin/apps", requireAdmin, (_req, res) => {
+    res.set("Cache-Control", "no-store");
+    res.json({ apps: adminApps });
   });
 
   app.get("/admin", requireDashboard, (_req, res) => {
