@@ -1,4 +1,5 @@
 import pg from "pg";
+import { getGrowthStats } from "./growthAnalytics.js";
 
 const { Pool } = pg;
 
@@ -669,6 +670,8 @@ export function createDatabase(connectionString = process.env.DATABASE_URL) {
       return result.rows[0];
     },
 
+    async getGrowthStats(filters) { return getGrowthStats(pool, filters); },
+
     async getRetention() {
       const summary = await pool.query(`
         WITH cohort AS (
@@ -676,9 +679,9 @@ export function createDatabase(connectionString = process.env.DATABASE_URL) {
           WHERE created_at >= now() - interval '90 days'
         )
         SELECT
-          count(*) FILTER (WHERE created_at <= now() - interval '1 day')::int AS d1_eligible,
+          count(*) FILTER (WHERE created_at <= now() - interval '2 days')::int AS d1_eligible,
           count(*) FILTER (
-            WHERE created_at <= now() - interval '1 day'
+            WHERE created_at <= now() - interval '2 days'
             AND EXISTS (
               SELECT 1 FROM analytics_events e
               WHERE e.installation_id = cohort.id
@@ -686,9 +689,9 @@ export function createDatabase(connectionString = process.env.DATABASE_URL) {
               AND e.occurred_at < cohort.created_at + interval '2 days'
             )
           )::int AS d1_retained,
-          count(*) FILTER (WHERE created_at <= now() - interval '7 days')::int AS d7_eligible,
+          count(*) FILTER (WHERE created_at <= now() - interval '8 days')::int AS d7_eligible,
           count(*) FILTER (
-            WHERE created_at <= now() - interval '7 days'
+            WHERE created_at <= now() - interval '8 days'
             AND EXISTS (
               SELECT 1 FROM analytics_events e
               WHERE e.installation_id = cohort.id
@@ -696,9 +699,9 @@ export function createDatabase(connectionString = process.env.DATABASE_URL) {
               AND e.occurred_at < cohort.created_at + interval '8 days'
             )
           )::int AS d7_retained,
-          count(*) FILTER (WHERE created_at <= now() - interval '30 days')::int AS d30_eligible,
+          count(*) FILTER (WHERE created_at <= now() - interval '31 days')::int AS d30_eligible,
           count(*) FILTER (
-            WHERE created_at <= now() - interval '30 days'
+            WHERE created_at <= now() - interval '31 days'
             AND EXISTS (
               SELECT 1 FROM analytics_events e
               WHERE e.installation_id = cohort.id

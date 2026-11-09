@@ -135,14 +135,63 @@ async function populate(panel, path, render, signal, errors) {
     panel.append(element("p", "This section could not be loaded. " + error.message, "load-error"));
   }
 }
+async function growth(signal, errors) {
+  const panel = section("Activation & retention", "Consenting installations only. Cohorts begin at first growth observation, not installation/download. Existing careers are excluded from new-player activation. Last 90 days; returns require a session in the exact D1 [1,2), D7 [7,8), D30 [30,31) day window, after that entire window has elapsed. Version selects cohort entry version; returns can occur after updating.");
+  const labels = { started: "Creation started", completed: "Career saved", NEW_CAREER: "New career", AVATAR: "Avatar", NAME: "Player name", POSITION: "Position", ARCHETYPE: "Archetype", HEIGHT_WEIGHT: "Height & weight", JERSEY_NUMBER: "Jersey number", TEAM_SELECTION: "Team", START_CAREER: "Enter league", under_1m: "Under 1 minute", "1_to_5m": "1–5 minutes", "5_to_15m": "5–15 minutes", "15_to_60m": "15–60 minutes", over_60m: "Over 1 hour", unknown: "Unknown", app_load: "Career data loading", local_save: "Local save", cloud_sync: "Cloud sync", unity_launch: "Field launch acceptance" };
+  const form = element("form", null, "toolbar");
+  const controls = {};
+  for (const [key, title, choices] of [["environment", "Analytics environment", ["production", "development", "test", "unknown"]], ["channel", "Distribution channel", ["app_store", "testflight", "development", "unknown", "all"]]]) {
+    const label = element("label", title);
+    const select = element("select");
+    choices.forEach(value => { const option = element("option", value); option.value = value; select.append(option); });
+    controls[key] = select; label.append(select); form.append(label);
+  }
+  const versionLabel = element("label", "App version (blank = all)");
+  const version = element("input"); version.type = "text"; version.maxLength = 32;
+  version.pattern = "[A-Za-z0-9._-]{1,32}"; versionLabel.append(version); form.append(versionLabel);
+  const button = element("button", "Apply filters", "small"); button.type = "submit"; form.append(button);
+  const body = element("div"); body.setAttribute("aria-live", "polite");
+  panel.append(form, body); $("content").append(panel);
+  let request = 0;
+  async function refresh() {
+    const token = ++request;
+    body.replaceChildren(element("p", "Loading growth statistics…", "section-body"));
+    button.disabled = true;
+    const query = new URLSearchParams({ environment: controls.environment.value, channel: controls.channel.value, version: version.value });
+    try {
+      const data = await json("/api/v1/admin/stats/growth?" + query, { signal });
+      if (signal.aborted || request !== token) return;
+      const s = data.summary;
+      body.replaceChildren(metrics([["Observed cohort", fmt(s.observed)], ["Existing progress at entry", fmt(s.existing)], ["No careers at cohort entry", fmt(s.new_players)], ["First game within 24h", pct(s.activationRate)], ["Mature 24h denominator", fmt(s.activation_eligible)]]));
+      body.append(table(["Return window", "Eligible", "Returned", "Rate"], data.retention, [r => "Day " + r.horizon, r => fmt(r.eligible), r => fmt(r.retained), r => pct(r.rate)], "Fully observed return windows · all cohort installations"));
+      const order = ["started", "NEW_CAREER", "AVATAR", "NAME", "POSITION", "ARCHETYPE", "HEIGHT_WEIGHT", "JERSEY_NUMBER", "TEAM_SELECTION", "START_CAREER", "completed"];
+      const counts = new Map(data.onboarding.map(r => [r.step, r.attempts]));
+      const steps = order.map(step => ({ step, attempts: counts.get(step) || 0 }));
+      body.append(table(["Creation milestone", "Distinct observed attempts", "% of starts"], steps, [r => labels[r.step] || r.step, r => fmt(r.attempts), r => pct(counts.get("started") > 0 ? r.attempts / counts.get("started") : null)], "Career creation · forward step confirmations and durably saved careers; attempts may begin on a resumed step"));
+      body.append(table(["Position", "Started as", "Installations", "Games started", "Games completed", "Completion rate"], data.modes, [r => r.position, r => r.mode, r => fmt(r.installations), r => fmt(r.started), r => fmt(r.completed), r => pct(r.completionRate)], "Career gameplay · matched opaque attempts; batch simulation is measured at durable completion; open games are not proven abandonment"));
+      const timingOrder = ["under_1m", "1_to_5m", "5_to_15m", "15_to_60m", "over_60m", "unknown"];
+      const timing = new Map(data.timing.map(r => [r.bucket, r.installations]));
+      body.append(table(["Elapsed wall time", "New-player installations"], timingOrder.map(bucket => ({ bucket, installations: timing.get(bucket) || 0 })), [r => labels[r.bucket] || r.bucket, r => fmt(r.installations)], "Time from consented observation to first durably completed game · includes background time"));
+      body.append(table(["Operation", "Result", "Timing category", "Observations", "Affected installations"], data.reliability, [r => labels[r.operation] || r.operation, r => r.result, r => r.latency_bucket, r => fmt(r.observations), r => fmt(r.installations)], "Reliability diagnostics · each operation/result/timing category sampled once per session; not crash rate or per-operation success rate"));
+      const details = element("details"); details.append(element("summary", "Measurement coverage · includes legacy and test data"), table(["Environment", "Channel", "Occurrence version", "Events"], data.coverage, [r => r.environment, r => r.channel, r => r.version, r => fmt(r.events)], "All 90-day telemetry coverage · independent of selected growth filters")); body.append(details);
+    } catch (error) {
+      if (signal.aborted || request !== token) return;
+      errors.push(error.message); body.replaceChildren(element("p", "Growth statistics could not load. " + error.message, "load-error"));
+    } finally { if (!signal.aborted && request === token) button.disabled = false; }
+  }
+  form.addEventListener("submit", event => { event.preventDefault(); void refresh(); });
+  await refresh();
+}
 async function football(signal, errors) {
   const overview = placeholder("Audience", "Consented API registrations and account records. These are not App Store downloads.");
-  const retention = placeholder("Return activity", "Observed event-based return rates from the existing API. Missing rates are shown as a dash.");
+  const growthTask = growth(signal, errors);
+  const retention = placeholder("Return activity", "Legacy registration cohorts: fully elapsed D1/D7/D30 return windows, any observed event. Separate from the filtered growth cohorts below and from App Store downloads. Missing rates are shown as a dash.");
   const funnel = placeholder("Career activity", "All-time independent installation counts. These do not establish ordered conversion.");
   const balance = placeholder("Position balance", "Average recorded career statistics by position.");
   const health = placeholder("Leaderboard health", "Published careers and rejected submissions.");
   const base = "/api/v1/admin/stats/";
   await Promise.all([
+    growthTask,
     populate(overview, base + "overview", (data, panel) => panel.append(metrics([["Registered installations", fmt(data.installations)], ["Accounts", fmt(data.accounts)], ["Last contact · 1 day", fmt(data.dau)], ["Last contact · 7 days", fmt(data.wau)], ["Last contact · 30 days", fmt(data.mau)], ["Events", fmt(data.events)], ["Cloud slots", fmt(data.cloud_slots)], ["Careers", fmt(data.careers)], ["Public careers", fmt(data.public_careers)], ["Most common version", data.current_app_version || "—"]])), signal, errors),
     populate(retention, base + "retention", (data, panel) => {
       panel.append(metrics([["Day 1 return", pct(data.d1.rate)], ["Day 7 return", pct(data.d7.rate)], ["Day 30 return", pct(data.d30.rate)], ["Peak observed activity · 30 days", fmt(Math.max(0, ...data.dailyActiveInstallations.map(row => Number(row.count))))]]));

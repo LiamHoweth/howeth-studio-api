@@ -110,3 +110,44 @@ Console HTML, CSS and browser behavior are in `src/adminDashboard.js` and
 `src/admin/`. The protected `GET /api/v1/admin/apps` supplies the capability map.
 The shared feedback GET accepts an exact catalog `product` ID; unknown or malformed
 filters return 400. Omitting `product` selects the existing shared inbox.
+
+## Football Era growth measurement
+
+`GET /api/v1/admin/stats/growth?environment=production&channel=app_store&version=`
+uses the existing admin bearer/Basic authentication. The Football Era console
+workspace displays it with environment, channel and optional version filters.
+Unconfigured/legacy data is identified in coverage, never silently relabeled as
+production. Existing legacy ingestion remains valid, and the bounded schema-2
+paid event contract is accepted so mixed client batches do not block gameplay
+measurement. No schema migration, account linkage, infrastructure or commerce
+verification behavior changes.
+
+Growth events: `growth_cohort_started`, `onboarding_started`,
+`onboarding_step_completed`, `onboarding_completed`, `career_game_started`,
+`career_game_completed`, `first_game_completed`, `reliability_result`. Properties
+are explicitly projected in `growthValidation.js`; session/provenance fields are
+validated by the shared event boundary. Matching references are random UUIDs,
+not career/account IDs. Event retries keep their IDs and existing unique event
+constraints deduplicate them; installation deletion continues to cascade.
+
+The cohort is the earliest retained consented growth observation in the selected
+environment/channel, within the last 90 days. It is not an install/download date.
+“No existing progress” means no occupied career at observation, not proof of a
+new person/device. Existing careers are excluded from 24-hour activation. Its
+eligible denominator has elapsed 24 hours; D1/D7/D30 session-return denominators
+have elapsed 2/8/31 days. Version filters apply to cohort entry; returns after
+updates are included. Creation is confirmed after a durable local save. Step
+counts are explicit forward confirmations within observed attempts, which may
+begin at a resumed step. Gameplay pairs start/completion UUIDs and displays the
+starting mode; completion can follow a fallback to decision simulation. Batch or
+resumed games without an observed start receive a paired start at commit time;
+these are not play-duration or abandonment metrics. First-game timing is coarse
+wall time since observation, including background time. Reliability categories
+are sampled once per session/operation/result/timing bucket, not operation
+success rates, crash rates or raw exception collection.
+
+Run real PostgreSQL metric tests with `TEST_DATABASE_URL` pointing only to a
+disposable database. Tests use a connection-local temporary events table; CI
+provides PostgreSQL 17. Never run fixture scripts against production. Current
+production players will supply new metrics only after an updated app is released
+and they opt into analytics. App Store analytics remain a separate source.
